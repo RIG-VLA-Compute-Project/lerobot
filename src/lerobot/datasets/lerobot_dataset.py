@@ -502,6 +502,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
         else:
             return get_hf_features_from_features(self.features)
 
+    def get_episode_info(self, episode_idx: int):
+        ep = self.meta.episodes[episode_idx]
+        return ep
+
+    def get_episode_len(self, episode_idx: int) -> int:
+        ep = self.get_episode_info(episode_idx)
+        return ep["length"]
+
     def _validate_decode_camera_streams(self) -> None:
         if self.decode_camera_streams is None:
             return
