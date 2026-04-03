@@ -26,6 +26,7 @@ import torch
 import torchvision
 from datasets.features.features import register_feature
 from torchcodec.decoders import VideoDecoder
+from torchcodec.transforms import Resize
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +122,7 @@ def decode_video_frames(
     timestamps: list[float],
     tolerance_s: float,
     backend: str | None = None,
+    shape: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """
     Decodes video frames using the specified backend.
@@ -130,6 +132,7 @@ def decode_video_frames(
         timestamps (list[float]): List of timestamps to extract frames.
         tolerance_s (float): Allowed deviation in seconds for frame retrieval.
         backend (str, optional): Backend to use for decoding. Defaults to "torchcodec" when available in the platform; otherwise, defaults to "pyav"..
+        shape (tuple[int, int], optional): Target HxW shape for the decoded frames. Only supported with torchcodec backend.
 
     Returns:
         torch.Tensor: Decoded frames.
@@ -139,7 +142,7 @@ def decode_video_frames(
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":
-        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s)
+        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s, shape=shape)
     elif backend in ["pyav", "video_reader"]:
         return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
     else:
@@ -261,6 +264,7 @@ def decode_video_frames_torchcodec(
     tolerance_s: float,
     log_loaded_timestamps: bool = False,
     decoder_cache = None,
+    shape: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Loads frames associated with the requested timestamps of a video using torchcodec.
 
@@ -270,6 +274,7 @@ def decode_video_frames_torchcodec(
         tolerance_s: Allowed deviation in seconds for frame retrieval.
         log_loaded_timestamps: Whether to log loaded timestamps.
         decoder_cache: Optional decoder cache instance. Uses default if None.
+        shape: Optional target HxW shape for the decoded frames.
 
     Note: Setting device="cuda" outside the main process, e.g. in data loader workers, will lead to CUDA initialization errors.
 
@@ -280,7 +285,8 @@ def decode_video_frames_torchcodec(
     can be adjusted during encoding to take into account decoding time and video size in bytes.
     """
 
-    decoder = VideoDecoder(str(video_path), seek_mode="approximate", num_ffmpeg_threads=1)
+    transforms = [Resize(shape)] if shape is not None else None
+    decoder = VideoDecoder(str(video_path), seek_mode="approximate", num_ffmpeg_threads=1, transforms=transforms)
 
     loaded_ts = []
     loaded_frames = []

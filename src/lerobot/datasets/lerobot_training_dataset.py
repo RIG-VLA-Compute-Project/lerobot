@@ -24,18 +24,17 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         repo_id: str,
         root: str | Path | None = None,
         episodes: list[int] | None = None,
-        image_transforms: Callable | None = None,
         decode_camera_streams: list[str] | None = None,
         delta_timestamps: dict[str, list[float]] | None = None,
         tolerance_s: float = 3e-4,
         revision: str | None = None,
         video_backend: str | None = None,
         required_keys: set[str] | None = None,
+        videos_hw: dict[str, tuple[int, int]] | None = None,
     ):
         super().__init__()
         self.repo_id = repo_id
         self.root = Path(root) if root else HF_LEROBOT_HOME / repo_id
-        self.image_transforms = image_transforms
         self.decode_camera_streams = set(decode_camera_streams) if decode_camera_streams else None
         self.delta_timestamps = delta_timestamps
         self.episodes = episodes
@@ -45,6 +44,7 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         self.required_keys = set(required_keys or [])
         self.delta_indices = None
         self._absolute_to_relative_idx = None
+        self.videos_hw = videos_hw
 
         if not self.root.exists():
             raise FileNotFoundError(f"Dataset root does not exist: {self.root}")
@@ -264,7 +264,8 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
 
             video_path = self.root / meta.get_video_file_path(ep_idx, vid_key)
-            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend)
+            video_hw = self.videos_hw.get(vid_key, None) if self.videos_hw is not None else None
+            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend, shape=video_hw)
             item[vid_key] = frames.squeeze(0)
 
         return item
@@ -306,11 +307,6 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
 
                 video_frames = self._query_videos(meta, query_timestamps, ep_idx, episode_info)
                 item = {**video_frames, **item}
-
-            if self.image_transforms is not None:
-                for cam in self.camera_keys:
-                    if cam in item:
-                        item[cam] = self.image_transforms(item[cam])
 
             task_idx = item["task_index"].item()
             item["task"] = self._task_names[task_idx]
