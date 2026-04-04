@@ -24,7 +24,7 @@ import av
 import pyarrow as pa
 import torch
 import torchvision
-from datasets.features.features import register_feature
+from datasets.features.features import register_feature, _FEATURE_TYPES
 from torchcodec.decoders import VideoDecoder
 from torchcodec.transforms import Resize
 
@@ -371,8 +371,8 @@ with warnings.catch_warnings():
         "'register_feature' is experimental and might be subject to breaking changes in the future.",
         category=UserWarning,
     )
-    # to make VideoFrame available in HuggingFace `datasets`
-    register_feature(VideoFrame, "VideoFrame")
+    if "VideoFrame" not in _FEATURE_TYPES:
+        register_feature(VideoFrame, "VideoFrame")
 
 
 def get_audio_info(video_path: Path | str) -> dict:
