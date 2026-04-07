@@ -60,6 +60,8 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         self._total_episodes = meta.total_episodes
         self._task_names = tuple(meta.tasks.index.tolist())
         self._subtask_names = None if meta.subtasks is None else tuple(meta.subtasks.index.tolist())
+        self._current_episode_idx: int | None = None
+        self._current_episode_cache: dict | None = None
 
         self._validate_decode_camera_streams()
 
@@ -92,6 +94,37 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             self.revision,
             force_cache_sync=False,
         )
+
+    def _get_current_episode_cache(self, episode_idx: int) -> dict:
+        if self._current_episode_idx == episode_idx and self._current_episode_cache is not None:
+            return self._current_episode_cache
+
+        meta = self._open_meta()
+        try:
+            ep = meta.episodes[episode_idx]
+            decode_video_keys = self._get_decode_video_keys()
+
+            def scalar(x):
+                return x.item() if isinstance(x, torch.Tensor) else x
+
+            cache = {
+                "dataset_from_index": scalar(ep["dataset_from_index"]),
+                "dataset_to_index": scalar(ep["dataset_to_index"]),
+                "video_from_timestamps": {
+                    vid_key: scalar(ep[f"videos/{vid_key}/from_timestamp"])
+                    for vid_key in decode_video_keys
+                },
+                "video_paths": {
+                    vid_key: self.root / meta.get_video_file_path(episode_idx, vid_key)
+                    for vid_key in decode_video_keys
+                },
+            }
+
+            self._current_episode_idx = episode_idx
+            self._current_episode_cache = cache
+            return cache
+        finally:
+            del meta
 
     def _open_hf_dataset(self) -> datasets.Dataset:
         features = get_hf_features_from_features(self.features)
@@ -191,10 +224,10 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
     def _get_query_indices(
         self,
         abs_idx: int,
-        episode_info,
+        episode_cache: dict,
     ) -> tuple[dict[str, list[int]], dict[str, torch.Tensor]]:
-        ep_start = episode_info["dataset_from_index"]
-        ep_end = episode_info["dataset_to_index"]
+        ep_start = episode_cache["dataset_from_index"]
+        ep_end = episode_cache["dataset_to_index"]
 
         query_indices = {
             key: [max(ep_start, min(ep_end - 1, abs_idx + delta)) for delta in delta_idx]
@@ -252,20 +285,24 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
 
     def _query_videos(
         self,
-        meta: LeRobotDatasetMetadata,
         query_timestamps: dict[str, list[float]],
-        ep_idx: int,
-        episode_info,
+        episode_cache: dict,
     ) -> dict[str, torch.Tensor]:
         item = {}
 
         for vid_key, query_ts in query_timestamps.items():
-            from_timestamp = episode_info[f"videos/{vid_key}/from_timestamp"]
+            from_timestamp = episode_cache["video_from_timestamps"][vid_key]
             shifted_query_ts = [from_timestamp + ts for ts in query_ts]
 
-            video_path = self.root / meta.get_video_file_path(ep_idx, vid_key)
+            video_path = episode_cache["video_paths"][vid_key]
             video_hw = self.videos_hw.get(vid_key, None) if self.videos_hw is not None else None
-            frames = decode_video_frames(video_path, shifted_query_ts, self.tolerance_s, self.video_backend, shape=video_hw)
+            frames = decode_video_frames(
+                video_path,
+                shifted_query_ts,
+                self.tolerance_s,
+                self.video_backend,
+                shape=video_hw,
+            )
             item[vid_key] = frames.squeeze(0)
 
         return item
@@ -274,18 +311,18 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         return self.num_frames
 
     def __getitem__(self, idx) -> dict:
-        meta = self._open_meta()
         hf_dataset = self._open_hf_dataset()
 
         try:
             item = hf_dataset[idx]
             ep_idx = item["episode_index"].item()
             abs_idx = item["index"].item()
-            episode_info = meta.episodes[ep_idx]
+
+            episode_cache = self._get_current_episode_cache(ep_idx)
 
             query_indices = None
             if self.delta_indices is not None:
-                query_indices, padding = self._get_query_indices(abs_idx, episode_info)
+                query_indices, padding = self._get_query_indices(abs_idx, episode_cache)
                 query_result = self._query_hf_dataset(hf_dataset, query_indices)
                 item = {**item, **padding}
                 for key, val in query_result.items():
@@ -305,7 +342,7 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
                     or key[:-len("_is_pad")] in decode_video_keys
                 }
 
-                video_frames = self._query_videos(meta, query_timestamps, ep_idx, episode_info)
+                video_frames = self._query_videos(query_timestamps, episode_cache)
                 item = {**video_frames, **item}
 
             task_idx = item["task_index"].item()
@@ -318,4 +355,3 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             return item
         finally:
             del hf_dataset
-            del meta
