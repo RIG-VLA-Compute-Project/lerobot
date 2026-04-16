@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 
-from collections.abc import Callable
 from pathlib import Path
 
-import datasets
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 import torch
 import torch.utils
 
@@ -11,9 +12,7 @@ from lerobot.datasets.dataset_metadata import CODEBASE_VERSION, LeRobotDatasetMe
 from lerobot.datasets.feature_utils import (
     check_delta_timestamps,
     get_delta_indices,
-    get_hf_features_from_features,
 )
-from lerobot.datasets.io_utils import hf_transform_to_torch, load_nested_dataset
 from lerobot.datasets.video_training_utils import decode_video_frames, get_safe_default_codec
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
@@ -23,7 +22,6 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         self,
         repo_id: str,
         root: str | Path | None = None,
-        episodes: list[int] | None = None,
         decode_camera_streams: list[str] | None = None,
         delta_timestamps: dict[str, list[float]] | None = None,
         tolerance_s: float = 3e-4,
@@ -37,14 +35,15 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         self.root = Path(root) if root else HF_LEROBOT_HOME / repo_id
         self.decode_camera_streams = set(decode_camera_streams) if decode_camera_streams else None
         self.delta_timestamps = delta_timestamps
-        self.episodes = episodes
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
         self.video_backend = video_backend if video_backend else get_safe_default_codec()
         self.required_keys = set(required_keys or [])
         self.delta_indices = None
-        self._absolute_to_relative_idx = None
         self.videos_hw = videos_hw
+
+        self._current_episode_table: pa.Table | None = None
+        self._keep_columns: list[str] | None = None
 
         if not self.root.exists():
             raise FileNotFoundError(f"Dataset root does not exist: {self.root}")
@@ -65,22 +64,34 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
 
         self._validate_decode_camera_streams()
 
-        temp_hf_dataset = self._open_hf_dataset()
         try:
-            if not self._check_local_episodes_sufficient(temp_hf_dataset, meta):
+            if not self._check_local_episodes_sufficient(meta):
                 raise FileNotFoundError(
-                    f"Local dataset at {self.root} does not contain all required files for episodes={self.episodes}"
+                    f"Local dataset at {self.root} does not contain all required files for episodes."
                 )
 
-            self._num_frames = len(temp_hf_dataset) if self.episodes is not None else self._total_frames
+            self._num_frames = self._total_frames
 
-            if self.episodes is not None:
-                self._absolute_to_relative_idx = {
-                    abs_idx.item() if isinstance(abs_idx, torch.Tensor) else abs_idx: rel_idx
-                    for rel_idx, abs_idx in enumerate(temp_hf_dataset["index"])
-                }
+            keep = set(self.required_keys)
+            keep |= {"episode_index", "index", "timestamp", "task_index"}
+            if self._subtask_names is not None:
+                keep.add("subtask_index")
+            self._keep_columns = sorted(keep)
         finally:
-            del temp_hf_dataset
+            del meta
+
+        self._abs_idx_to_episode_idx = {}
+
+        episode_iter = range(self._total_episodes)
+        meta = self._open_meta()
+        try:
+            for ep_idx in episode_iter:
+                ep = meta.episodes[ep_idx]
+                ep_start = ep["dataset_from_index"].item() if hasattr(ep["dataset_from_index"], "item") else ep["dataset_from_index"]
+                ep_end = ep["dataset_to_index"].item() if hasattr(ep["dataset_to_index"], "item") else ep["dataset_to_index"]
+                for abs_idx in range(ep_start, ep_end):
+                    self._abs_idx_to_episode_idx[abs_idx] = ep_idx
+        finally:
             del meta
 
         if self.delta_timestamps is not None:
@@ -107,9 +118,22 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             def scalar(x):
                 return x.item() if isinstance(x, torch.Tensor) else x
 
+            chunk_index = scalar(ep["data/chunk_index"])
+            file_index = scalar(ep["data/file_index"])
+            dataset_from_index = scalar(ep["dataset_from_index"])
+            dataset_to_index = scalar(ep["dataset_to_index"])
+
+            parquet_path = self.root / meta.data_path.format(
+                chunk_index=chunk_index,
+                file_index=file_index,
+            )
+
             cache = {
-                "dataset_from_index": scalar(ep["dataset_from_index"]),
-                "dataset_to_index": scalar(ep["dataset_to_index"]),
+                "dataset_from_index": dataset_from_index,
+                "dataset_to_index": dataset_to_index,
+                "episode_length": dataset_to_index - dataset_from_index,
+                "parquet_path": parquet_path,
+                "episode_index": episode_idx,
                 "video_from_timestamps": {
                     vid_key: scalar(ep[f"videos/{vid_key}/from_timestamp"])
                     for vid_key in decode_video_keys
@@ -126,49 +150,67 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         finally:
             del meta
 
-    def _open_hf_dataset(self) -> datasets.Dataset:
-        features = get_hf_features_from_features(self.features)
-        hf_dataset = load_nested_dataset(self.root / "data", features=features, episodes=self.episodes)
+    def _ensure_current_episode_table(self, episode_cache: dict) -> pa.Table:
+        if (
+            self._current_episode_table is not None
+            and self._current_episode_idx == episode_cache["episode_index"]
+        ):
+            return self._current_episode_table
 
-        keep = set(self.required_keys)
-        keep |= {"episode_index", "index", "timestamp", "task_index"}
-        if "subtask_index" in hf_dataset.column_names:
-            keep.add("subtask_index")
+        table = pq.read_table(
+            episode_cache["parquet_path"],
+            columns=self._keep_columns,
+            filters=[("episode_index", "=", episode_cache["episode_index"])],
+        )
 
-        keep = [c for c in hf_dataset.column_names if c in keep]
-        hf_dataset = hf_dataset.select_columns(keep)
-        hf_dataset.set_transform(hf_transform_to_torch)
-        return hf_dataset
+        index_values = table["index"].to_pylist()
+        expected = list(range(
+            episode_cache["dataset_from_index"],
+            episode_cache["dataset_to_index"],
+        ))
+        if index_values != expected:
+            raise RuntimeError(
+                f"Unexpected row order or contents for episode {episode_cache['episode_index']} "
+                f"in {episode_cache['parquet_path']}"
+            )
+        
+        if table.num_rows != episode_cache["episode_length"]:
+            raise RuntimeError(
+                f"Unexpected number of rows for episode {episode_cache['episode_index']} "
+                f"in {episode_cache['parquet_path']}: "
+                f"{table.num_rows} != {episode_cache['episode_length']}"
+            )
+
+        self._current_episode_table = table
+        return table
 
     def _check_local_episodes_sufficient(
         self,
-        hf_dataset: datasets.Dataset,
         meta: LeRobotDatasetMetadata,
     ) -> bool:
-        if hf_dataset is None or len(hf_dataset) == 0:
-            return False
-
-        available_episodes = {
-            ep_idx.item() if isinstance(ep_idx, torch.Tensor) else ep_idx
-            for ep_idx in hf_dataset.unique("episode_index")
-        }
-
         requested_episodes = (
             set(range(meta.total_episodes))
-            if self.episodes is None
-            else set(self.episodes)
         )
 
-        if not requested_episodes.issubset(available_episodes):
-            return False
-
         required_video_keys = self._get_decode_video_keys()
-        if len(required_video_keys) > 0:
-            for ep_idx in requested_episodes:
-                for vid_key in required_video_keys:
-                    video_path = self.root / meta.get_video_file_path(ep_idx, vid_key)
-                    if not video_path.exists():
-                        return False
+
+        for ep_idx in requested_episodes:
+            ep = meta.episodes[ep_idx]
+
+            def scalar(x):
+                return x.item() if isinstance(x, torch.Tensor) else x
+
+            parquet_path = self.root / meta.data_path.format(
+                chunk_index=scalar(ep["data/chunk_index"]),
+                file_index=scalar(ep["data/file_index"]),
+            )
+            if not parquet_path.exists():
+                return False
+
+            for vid_key in required_video_keys:
+                video_path = self.root / meta.get_video_file_path(ep_idx, vid_key)
+                if not video_path.exists():
+                    return False
 
         return True
 
@@ -220,6 +262,33 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         if self.decode_camera_streams is None:
             return list(self.video_keys)
         return [key for key in self.video_keys if key in self.decode_camera_streams]
+    
+    def _episode_local_index(self, abs_idx: int, episode_cache: dict) -> int:
+        return abs_idx - episode_cache["dataset_from_index"]
+
+    def _arrow_scalar_to_python(self, value):
+        if hasattr(value, "as_py"):
+            return value.as_py()
+        return value
+
+    def _table_row_to_item(self, table: pa.Table, row_idx: int) -> dict:
+        item = {}
+        for key in table.column_names:
+            value = table[key][row_idx]
+            value = self._arrow_scalar_to_python(value)
+
+            if isinstance(value, list):
+                item[key] = torch.tensor(value)
+            elif isinstance(value, bool):
+                item[key] = torch.tensor(value)
+            elif isinstance(value, int):
+                item[key] = torch.tensor(value)
+            elif isinstance(value, float):
+                item[key] = torch.tensor(value)
+            else:
+                item[key] = value
+
+        return item
 
     def _get_query_indices(
         self,
@@ -243,43 +312,50 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
 
     def _get_query_timestamps(
         self,
-        hf_dataset: datasets.Dataset,
+        episode_table: pa.Table,
+        episode_cache: dict,
         current_ts: float,
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
+        ts_col = episode_table["timestamp"]
+
         for key in self.video_keys:
             if query_indices is not None and key in query_indices:
-                if self._absolute_to_relative_idx is not None:
-                    relative_indices = [self._absolute_to_relative_idx[idx] for idx in query_indices[key]]
-                    timestamps = hf_dataset[relative_indices]["timestamp"]
-                else:
-                    timestamps = hf_dataset[query_indices[key]]["timestamp"]
-                query_timestamps[key] = torch.stack(timestamps).tolist()
+                local_indices = [
+                    self._episode_local_index(idx, episode_cache)
+                    for idx in query_indices[key]
+                ]
+                timestamps = pc.take(ts_col, pa.array(local_indices))
+                query_timestamps[key] = [x.as_py() for x in timestamps]
             else:
                 query_timestamps[key] = [current_ts]
+
         return query_timestamps
 
-    def _query_hf_dataset(
+    def _query_episode_table(
         self,
-        hf_dataset: datasets.Dataset,
+        episode_table: pa.Table,
+        episode_cache: dict,
         query_indices: dict[str, list[int]],
     ) -> dict:
         result = {}
+
         for key, q_idx in query_indices.items():
             if key in self.video_keys:
                 continue
 
-            relative_indices = (
-                q_idx
-                if self._absolute_to_relative_idx is None
-                else [self._absolute_to_relative_idx[idx] for idx in q_idx]
-            )
+            local_indices = [
+                self._episode_local_index(idx, episode_cache)
+                for idx in q_idx
+            ]
+            taken = pc.take(episode_table[key], pa.array(local_indices))
+            values = [self._arrow_scalar_to_python(x) for x in taken]
 
-            try:
-                result[key] = torch.stack(hf_dataset[key][relative_indices])
-            except (KeyError, TypeError, IndexError):
-                result[key] = torch.stack(hf_dataset[relative_indices][key])
+            if len(values) > 0 and isinstance(values[0], list):
+                result[key] = torch.tensor(values)
+            else:
+                result[key] = torch.tensor(values)
 
         return result
 
@@ -311,47 +387,51 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         return self.num_frames
 
     def __getitem__(self, idx) -> dict:
-        hf_dataset = self._open_hf_dataset()
+        abs_idx = idx
 
-        try:
-            item = hf_dataset[idx]
-            ep_idx = item["episode_index"].item()
-            abs_idx = item["index"].item()
+        ep_idx = self._abs_idx_to_episode_idx.get(abs_idx)
+        if ep_idx is None:
+            raise IndexError(f"Index out of bounds: {idx}")
 
-            episode_cache = self._get_current_episode_cache(ep_idx)
+        episode_cache = self._get_current_episode_cache(ep_idx)
+        episode_table = self._ensure_current_episode_table(episode_cache)
 
-            query_indices = None
-            if self.delta_indices is not None:
-                query_indices, padding = self._get_query_indices(abs_idx, episode_cache)
-                query_result = self._query_hf_dataset(hf_dataset, query_indices)
-                item = {**item, **padding}
-                for key, val in query_result.items():
-                    item[key] = val
+        local_idx = self._episode_local_index(abs_idx, episode_cache)
+        item = self._table_row_to_item(episode_table, local_idx)
 
-            decode_video_keys = self._get_decode_video_keys()
-            if len(decode_video_keys) > 0:
-                current_ts = item["timestamp"].item()
-                query_timestamps = self._get_query_timestamps(hf_dataset, current_ts, query_indices)
-                query_timestamps = {key: value for key, value in query_timestamps.items() if key in decode_video_keys}
+        query_indices = None
+        if self.delta_indices is not None:
+            query_indices, padding = self._get_query_indices(abs_idx, episode_cache)
+            query_result = self._query_episode_table(episode_table, episode_cache, query_indices)
+            item = {**item, **padding, **query_result}
 
-                item = {
-                    key: value
-                    for key, value in item.items()
-                    if not key.endswith("_is_pad")
-                    or key[:-len("_is_pad")] not in self.video_keys
-                    or key[:-len("_is_pad")] in decode_video_keys
-                }
+        decode_video_keys = self._get_decode_video_keys()
+        if len(decode_video_keys) > 0:
+            current_ts = item["timestamp"].item()
+            query_timestamps = self._get_query_timestamps(
+                episode_table, episode_cache, current_ts, query_indices
+            )
+            query_timestamps = {
+                key: value for key, value in query_timestamps.items()
+                if key in decode_video_keys
+            }
 
-                video_frames = self._query_videos(query_timestamps, episode_cache)
-                item = {**video_frames, **item}
+            item = {
+                key: value
+                for key, value in item.items()
+                if not key.endswith("_is_pad")
+                or key[:-len("_is_pad")] not in self.video_keys
+                or key[:-len("_is_pad")] in decode_video_keys
+            }
 
-            task_idx = item["task_index"].item()
-            item["task"] = self._task_names[task_idx]
+            video_frames = self._query_videos(query_timestamps, episode_cache)
+            item = {**video_frames, **item}
 
-            if "subtask_index" in item and self._subtask_names is not None:
-                subtask_idx = item["subtask_index"].item()
-                item["subtask"] = self._subtask_names[subtask_idx]
+        task_idx = item["task_index"].item()
+        item["task"] = self._task_names[task_idx]
 
-            return item
-        finally:
-            del hf_dataset
+        if "subtask_index" in item and self._subtask_names is not None:
+            subtask_idx = item["subtask_index"].item()
+            item["subtask"] = self._subtask_names[subtask_idx]
+
+        return item
