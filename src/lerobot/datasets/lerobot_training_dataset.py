@@ -43,6 +43,7 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         self.videos_hw = videos_hw
 
         self._current_episode_table: pa.Table | None = None
+        self._current_index_to_row: dict[int, int] | None = None
         self._keep_columns: list[str] | None = None
 
         if not self.root.exists():
@@ -228,6 +229,7 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         if (
             self._current_episode_table is not None
             and self._current_episode_idx == episode_cache["episode_index"]
+            and self._current_index_to_row is not None
         ):
             return self._current_episode_table
 
@@ -251,10 +253,6 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
                 f"Extra indices: {extra[:10]}"
             )
 
-        episode_cache["index_to_row"] = {
-            abs_idx: row_idx for row_idx, abs_idx in enumerate(index_values)
-        }
-        
         if table.num_rows != episode_cache["episode_length"]:
             raise RuntimeError(
                 f"Unexpected number of rows for episode {episode_cache['episode_index']} "
@@ -262,6 +260,9 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
                 f"{table.num_rows} != {episode_cache['episode_length']}"
             )
 
+        self._current_index_to_row = {
+            abs_idx: row_idx for row_idx, abs_idx in enumerate(index_values)
+        }
         self._current_episode_table = table
         return table
 
@@ -355,8 +356,14 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         return [key for key in self.video_keys if key in self.decode_camera_streams]
     
     def _episode_local_index(self, abs_idx: int, episode_cache: dict) -> int:
+        if self._current_index_to_row is None:
+            raise RuntimeError(
+                f"No index-to-row mapping cached for episode {episode_cache['episode_index']} "
+                f"and parquet file {episode_cache['parquet_path']}"
+            )
+
         try:
-            return episode_cache["index_to_row"][abs_idx]
+            return self._current_index_to_row[abs_idx]
         except KeyError as e:
             raise KeyError(
                 f"Absolute index {abs_idx} not found in episode {episode_cache['episode_index']} "
