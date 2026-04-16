@@ -174,7 +174,10 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
     def _read_episode_table(self, episode_cache: dict, columns: list[str]) -> pa.Table:
         table = pq.read_table(
             episode_cache["parquet_path"],
-            filters=[("episode_index", "=", episode_cache["episode_index"])],
+            filters=[
+                ("index", ">=", episode_cache["dataset_from_index"]),
+                ("index", "<", episode_cache["dataset_to_index"]),
+            ],
         )
 
         available_columns = set(table.column_names)
@@ -217,7 +220,9 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
                 f"Extra indices: {extra[:10]}"
             )
 
-        episode_cache["index_to_row"] = {abs_idx: row_idx for row_idx, abs_idx in enumerate(index_values)}
+        episode_cache["index_to_row"] = {
+            abs_idx: row_idx for row_idx, abs_idx in enumerate(index_values)
+        }
         
         if table.num_rows != episode_cache["episode_length"]:
             raise RuntimeError(
