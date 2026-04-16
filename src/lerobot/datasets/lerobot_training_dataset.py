@@ -201,15 +201,23 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         table = self._read_episode_table(episode_cache, columns)
 
         index_values = table["index"].to_pylist()
-        expected = list(range(
+        expected = set(range(
             episode_cache["dataset_from_index"],
             episode_cache["dataset_to_index"],
         ))
-        if index_values != expected:
+        actual = set(index_values)
+
+        if actual != expected:
+            missing = sorted(expected - actual)
+            extra = sorted(actual - expected)
             raise RuntimeError(
-                f"Unexpected row order or contents for episode {episode_cache['episode_index']} "
-                f"in {episode_cache['parquet_path']}"
+                f"Unexpected index contents for episode {episode_cache['episode_index']} "
+                f"in {episode_cache['parquet_path']}. "
+                f"Missing indices: {missing[:10]} "
+                f"Extra indices: {extra[:10]}"
             )
+
+        episode_cache["index_to_row"] = {abs_idx: row_idx for row_idx, abs_idx in enumerate(index_values)}
         
         if table.num_rows != episode_cache["episode_length"]:
             raise RuntimeError(
@@ -311,7 +319,13 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         return [key for key in self.video_keys if key in self.decode_camera_streams]
     
     def _episode_local_index(self, abs_idx: int, episode_cache: dict) -> int:
-        return abs_idx - episode_cache["dataset_from_index"]
+        try:
+            return episode_cache["index_to_row"][abs_idx]
+        except KeyError as e:
+            raise KeyError(
+                f"Absolute index {abs_idx} not found in episode {episode_cache['episode_index']} "
+                f"for parquet file {episode_cache['parquet_path']}"
+            ) from e
 
     def _arrow_scalar_to_python(self, value):
         if hasattr(value, "as_py"):
