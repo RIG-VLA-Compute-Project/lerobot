@@ -76,7 +76,10 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             keep |= {"episode_index", "index", "timestamp", "task_index"}
             if self._subtask_names is not None:
                 keep.add("subtask_index")
+
             self._keep_columns = sorted(keep)
+            if len(self._keep_columns) == 0:
+                raise ValueError("No parquet columns requested")
         finally:
             del meta
 
@@ -150,6 +153,42 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         finally:
             del meta
 
+    def _get_validated_parquet_columns(self, parquet_path: Path) -> list[str]:
+        parquet_file = pq.ParquetFile(parquet_path)
+        available_columns = set(parquet_file.schema_arrow.names)
+
+        missing_columns = [c for c in self._keep_columns if c not in available_columns]
+        if missing_columns:
+            available_sorted = sorted(available_columns)
+            missing_sorted = sorted(missing_columns)
+            raise KeyError(
+                "Requested parquet columns are missing.\n"
+                f"File: {parquet_path}\n"
+                f"Missing: {missing_sorted}\n"
+                f"Available: {available_sorted}"
+            )
+
+        return list(self._keep_columns)
+    
+    def _read_episode_table(self, episode_cache: dict, columns: list[str]) -> pa.Table:
+        table = pq.read_table(
+            episode_cache["parquet_path"],
+            filters=[("episode_index", "=", episode_cache["episode_index"])],
+        )
+
+        available_columns = set(table.column_names)
+        missing_columns = [c for c in columns if c not in available_columns]
+        if missing_columns:
+            raise KeyError(
+                "Requested parquet columns are missing after reading filtered episode table.\n"
+                f"File: {episode_cache['parquet_path']}\n"
+                f"Episode: {episode_cache['episode_index']}\n"
+                f"Missing: {sorted(missing_columns)}\n"
+                f"Available: {sorted(available_columns)}"
+            )
+
+        return table.select(columns)
+
     def _ensure_current_episode_table(self, episode_cache: dict) -> pa.Table:
         if (
             self._current_episode_table is not None
@@ -157,11 +196,8 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         ):
             return self._current_episode_table
 
-        table = pq.read_table(
-            episode_cache["parquet_path"],
-            columns=self._keep_columns,
-            filters=[("episode_index", "=", episode_cache["episode_index"])],
-        )
+        columns = self._get_validated_parquet_columns(episode_cache["parquet_path"])
+        table = self._read_episode_table(episode_cache, columns)
 
         index_values = table["index"].to_pylist()
         expected = list(range(
