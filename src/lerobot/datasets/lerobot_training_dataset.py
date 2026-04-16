@@ -167,6 +167,10 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
                 },
             }
 
+            if self._current_episode_idx != episode_idx:
+                self._current_episode_table = None
+                self._current_index_to_row = None
+
             self._current_episode_idx = episode_idx
             self._current_episode_cache = cache
             return cache
@@ -264,6 +268,7 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             abs_idx: row_idx for row_idx, abs_idx in enumerate(index_values)
         }
         self._current_episode_table = table
+        self._current_episode_cache = episode_cache
         return table
 
     def _check_local_episodes_sufficient(
