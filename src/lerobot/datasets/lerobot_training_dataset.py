@@ -132,6 +132,24 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
                 file_index=file_index,
             )
 
+            # TODO - this seems to be necessary for AgiBotWorldBeta specifically.
+            # Maybe this is an issue for any dataset which at some point used the official lerobot conversion code?
+            # In any case we should harden this to wrap around the chunk index too
+            if not self._parquet_contains_index(parquet_path, dataset_from_index):
+                next_parquet_path = self.root / meta.data_path.format(
+                    chunk_index=chunk_index,
+                    file_index=file_index + 1,
+                )
+
+                if self._parquet_contains_index(next_parquet_path, dataset_from_index):
+                    parquet_path = next_parquet_path
+                else:
+                    raise RuntimeError(
+                        f"Could not locate dataset_from_index={dataset_from_index} "
+                        f"for episode {episode_idx} in metadata parquet file {parquet_path} "
+                        f"or fallback parquet file {next_parquet_path}"
+                    )
+
             cache = {
                 "dataset_from_index": dataset_from_index,
                 "dataset_to_index": dataset_to_index,
@@ -170,6 +188,19 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             )
 
         return list(self._keep_columns)
+    
+    def _parquet_contains_index(self, parquet_path: Path, target_index: int) -> bool:
+        if not parquet_path.exists():
+            return False
+
+        parquet_file = pq.ParquetFile(parquet_path)
+        index_table = parquet_file.read(columns=["index"])
+        index_values = index_table.column("index").to_pylist()
+
+        if len(index_values) == 0:
+            return False
+
+        return index_values[0] <= target_index <= index_values[-1]
     
     def _read_episode_table(self, episode_cache: dict, columns: list[str]) -> pa.Table:
         table = pq.read_table(
