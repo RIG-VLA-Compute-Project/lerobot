@@ -63,6 +63,7 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         self._current_episode_cache: dict | None = None
 
         self._validate_decode_camera_streams()
+        self._meta_video_feature_keys = self._get_video_feature_keys_from_meta()
 
         try:
             if not self._check_local_episodes_sufficient(meta):
@@ -72,7 +73,7 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
 
             self._num_frames = self._total_frames
 
-            keep = set(self.required_keys)
+            keep = set(self.required_keys) - self._meta_video_feature_keys
             keep |= {"episode_index", "index", "timestamp", "task_index"}
             if self._subtask_names is not None:
                 keep.add("subtask_index")
@@ -293,6 +294,16 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
                 f"Unknown decode_camera_streams: {unknown_streams}. "
                 f"Available video streams: {self.video_keys}."
             )
+        
+    def _get_video_feature_keys_from_meta(self) -> set[str]:
+        video_keys = set()
+
+        for feature_name, feature_def in self.features.items():
+            dtype = feature_def.get("dtype") if isinstance(feature_def, dict) else getattr(feature_def, "dtype", None)
+            if dtype == "video":
+                video_keys.add(feature_name)
+
+        return video_keys
 
     def _get_decode_video_keys(self) -> list[str]:
         if self.decode_camera_streams is None:
