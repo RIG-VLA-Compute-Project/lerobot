@@ -5,10 +5,12 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
+from bisect import bisect_right
 import torch
 import torch.utils
 
-from lerobot.datasets.dataset_metadata import CODEBASE_VERSION, LeRobotDatasetMetadata
+from lerobot.datasets.dataset_metadata import CODEBASE_VERSION
+from lerobot.datasets.training_dataset_metadata import LeRobotTrainingDatasetMetadata
 from lerobot.datasets.feature_utils import (
     check_delta_timestamps,
     get_delta_indices,
@@ -42,31 +44,33 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         self.delta_indices = None
         self.videos_hw = videos_hw
 
-        self._current_episode_table: pa.Table | None = None
-        self._current_index_to_row: dict[int, int] | None = None
+        self._current_parquet_path: Path | None = None
+        self._current_parquet_file: pq.ParquetFile | None = None
+        self._current_row_group_locator: list[tuple[int, int, int]] | None = None
         self._keep_columns: list[str] | None = None
 
         if not self.root.exists():
             raise FileNotFoundError(f"Dataset root does not exist: {self.root}")
 
-        # Open metadata once, extract only lightweight state, then forget it.
-        meta = self._open_meta()
-
-        self._fps = meta.fps
-        self._features = meta.features
-        self._video_keys = tuple(meta.video_keys)
-        self._camera_keys = tuple(meta.camera_keys)
-        self._total_frames = meta.total_frames
-        self._total_episodes = meta.total_episodes
-        self._task_names = tuple(meta.tasks.index.tolist())
-        self._subtask_names = None if meta.subtasks is None else tuple(meta.subtasks.index.tolist())
         self._current_episode_idx: int | None = None
         self._current_episode_cache: dict | None = None
+        self._episode_starts: list[int] = []
+        self._episode_ends: list[int] = []
 
-        self._validate_decode_camera_streams()
-        self._meta_video_feature_keys = self._get_video_feature_keys_from_meta()
-
+        meta = self._open_meta()
         try:
+            self._fps = meta.fps
+            self._features = meta.features
+            self._video_keys = tuple(meta.video_keys)
+            self._camera_keys = tuple(meta.camera_keys)
+            self._total_frames = meta.total_frames
+            self._total_episodes = meta.total_episodes
+            self._task_names = tuple(meta.tasks.index.tolist())
+            self._subtask_names = None if meta.subtasks is None else tuple(meta.subtasks.index.tolist())
+
+            self._validate_decode_camera_streams()
+            self._meta_video_feature_keys = self._get_video_feature_keys_from_meta()
+
             if not self._check_local_episodes_sufficient(meta):
                 raise FileNotFoundError(
                     f"Local dataset at {self.root} does not contain all required files for episodes."
@@ -82,20 +86,14 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             self._keep_columns = sorted(keep)
             if len(self._keep_columns) == 0:
                 raise ValueError("No parquet columns requested")
-        finally:
-            del meta
 
-        self._abs_idx_to_episode_idx = {}
+            def scalar(x):
+                return x.item() if hasattr(x, "item") else x
 
-        episode_iter = range(self._total_episodes)
-        meta = self._open_meta()
-        try:
-            for ep_idx in episode_iter:
+            for ep_idx in range(self._total_episodes):
                 ep = meta.episodes[ep_idx]
-                ep_start = ep["dataset_from_index"].item() if hasattr(ep["dataset_from_index"], "item") else ep["dataset_from_index"]
-                ep_end = ep["dataset_to_index"].item() if hasattr(ep["dataset_to_index"], "item") else ep["dataset_to_index"]
-                for abs_idx in range(ep_start, ep_end):
-                    self._abs_idx_to_episode_idx[abs_idx] = ep_idx
+                self._episode_starts.append(scalar(ep["dataset_from_index"]))
+                self._episode_ends.append(scalar(ep["dataset_to_index"]))
         finally:
             del meta
 
@@ -103,12 +101,11 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
-    def _open_meta(self) -> LeRobotDatasetMetadata:
-        return LeRobotDatasetMetadata(
+    def _open_meta(self) -> LeRobotTrainingDatasetMetadata:
+        return LeRobotTrainingDatasetMetadata(
             self.repo_id,
             self.root,
             self.revision,
-            force_cache_sync=False,
         )
 
     def _get_current_episode_cache(self, episode_idx: int) -> dict:
@@ -167,9 +164,10 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
                 },
             }
 
-            if self._current_episode_idx != episode_idx:
-                self._current_episode_table = None
-                self._current_index_to_row = None
+            if self._current_episode_idx != episode_idx or self._current_parquet_path != parquet_path:
+                self._current_parquet_path = None
+                self._current_parquet_file = None
+                self._current_row_group_locator = None
 
             self._current_episode_idx = episode_idx
             self._current_episode_cache = cache
@@ -177,22 +175,97 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         finally:
             del meta
 
-    def _get_validated_parquet_columns(self, parquet_path: Path) -> list[str]:
-        parquet_file = pq.ParquetFile(parquet_path)
-        available_columns = set(parquet_file.schema_arrow.names)
+    def _ensure_current_parquet_locator(
+        self,
+        episode_cache: dict,
+    ) -> tuple[pq.ParquetFile, list[tuple[int, int, int]]]:
+        parquet_path = episode_cache["parquet_path"]
 
+        if (
+            self._current_parquet_path == parquet_path
+            and self._current_parquet_file is not None
+            and self._current_row_group_locator is not None
+        ):
+            return self._current_parquet_file, self._current_row_group_locator
+
+        parquet_file = pq.ParquetFile(parquet_path)
+
+        available_columns = set(parquet_file.schema_arrow.names)
         missing_columns = [c for c in self._keep_columns if c not in available_columns]
         if missing_columns:
-            available_sorted = sorted(available_columns)
-            missing_sorted = sorted(missing_columns)
             raise KeyError(
                 "Requested parquet columns are missing.\n"
                 f"File: {parquet_path}\n"
-                f"Missing: {missing_sorted}\n"
-                f"Available: {available_sorted}"
+                f"Missing: {sorted(missing_columns)}\n"
+                f"Available: {sorted(available_columns)}"
             )
 
-        return list(self._keep_columns)
+        try:
+            index_col_idx = parquet_file.schema_arrow.names.index("index")
+        except ValueError as e:
+            raise KeyError(f"'index' column not found in parquet file: {parquet_path}") from e
+
+        locator = []
+        for rg_idx in range(parquet_file.metadata.num_row_groups):
+            col_meta = parquet_file.metadata.row_group(rg_idx).column(index_col_idx)
+            stats = col_meta.statistics
+            if stats is None or stats.min is None or stats.max is None:
+                raise RuntimeError(
+                    f"Parquet row-group statistics for 'index' are missing in {parquet_path}. "
+                    "Path B relies on min/max row-group stats for fast sparse reads."
+                )
+            locator.append((int(stats.min), int(stats.max), rg_idx))
+
+        self._current_parquet_path = parquet_path
+        self._current_parquet_file = parquet_file
+        self._current_row_group_locator = locator
+        return parquet_file, locator
+
+    def _read_rows_for_abs_indices(
+        self,
+        episode_cache: dict,
+        abs_indices: list[int],
+    ) -> tuple[pa.Table, dict[int, int]]:
+        parquet_file, locator = self._ensure_current_parquet_locator(episode_cache)
+
+        target_indices = sorted(set(int(i) for i in abs_indices))
+        if len(target_indices) == 0:
+            raise ValueError("No indices requested")
+
+        lo = target_indices[0]
+        hi = target_indices[-1]
+
+        needed_row_groups = [
+            rg_idx
+            for rg_min, rg_max, rg_idx in locator
+            if rg_max >= lo and rg_min <= hi
+        ]
+        if len(needed_row_groups) == 0:
+            raise RuntimeError(
+                f"No row groups found for requested indices {lo}..{hi} "
+                f"in {episode_cache['parquet_path']}"
+            )
+
+        table = parquet_file.read_row_groups(
+            needed_row_groups,
+            columns=self._keep_columns,
+        )
+
+        index_array = table["index"]
+        mask = pc.is_in(index_array, value_set=pa.array(target_indices, type=index_array.type))
+        table = table.filter(mask)
+
+        index_values = table["index"].to_pylist()
+        row_by_index = {abs_idx: row_idx for row_idx, abs_idx in enumerate(index_values)}
+
+        missing = [abs_idx for abs_idx in target_indices if abs_idx not in row_by_index]
+        if missing:
+            raise RuntimeError(
+                f"Requested indices not found after sparse parquet read for "
+                f"{episode_cache['parquet_path']}: {missing[:10]}"
+            )
+
+        return table, row_by_index
     
     def _parquet_contains_index(self, parquet_path: Path, target_index: int) -> bool:
         if not parquet_path.exists():
@@ -206,74 +279,10 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             return False
 
         return index_values[0] <= target_index <= index_values[-1]
-    
-    def _read_episode_table(self, episode_cache: dict, columns: list[str]) -> pa.Table:
-        table = pq.read_table(
-            episode_cache["parquet_path"],
-            filters=[
-                ("index", ">=", episode_cache["dataset_from_index"]),
-                ("index", "<", episode_cache["dataset_to_index"]),
-            ],
-        )
-
-        available_columns = set(table.column_names)
-        missing_columns = [c for c in columns if c not in available_columns]
-        if missing_columns:
-            raise KeyError(
-                "Requested parquet columns are missing after reading filtered episode table.\n"
-                f"File: {episode_cache['parquet_path']}\n"
-                f"Episode: {episode_cache['episode_index']}\n"
-                f"Missing: {sorted(missing_columns)}\n"
-                f"Available: {sorted(available_columns)}"
-            )
-
-        return table.select(columns)
-
-    def _ensure_current_episode_table(self, episode_cache: dict) -> pa.Table:
-        if (
-            self._current_episode_table is not None
-            and self._current_episode_idx == episode_cache["episode_index"]
-            and self._current_index_to_row is not None
-        ):
-            return self._current_episode_table
-
-        columns = self._get_validated_parquet_columns(episode_cache["parquet_path"])
-        table = self._read_episode_table(episode_cache, columns)
-
-        index_values = table["index"].to_pylist()
-        expected = set(range(
-            episode_cache["dataset_from_index"],
-            episode_cache["dataset_to_index"],
-        ))
-        actual = set(index_values)
-
-        if actual != expected:
-            missing = sorted(expected - actual)
-            extra = sorted(actual - expected)
-            raise RuntimeError(
-                f"Unexpected index contents for episode {episode_cache['episode_index']} "
-                f"in {episode_cache['parquet_path']}. "
-                f"Missing indices: {missing[:10]} "
-                f"Extra indices: {extra[:10]}"
-            )
-
-        if table.num_rows != episode_cache["episode_length"]:
-            raise RuntimeError(
-                f"Unexpected number of rows for episode {episode_cache['episode_index']} "
-                f"in {episode_cache['parquet_path']}: "
-                f"{table.num_rows} != {episode_cache['episode_length']}"
-            )
-
-        self._current_index_to_row = {
-            abs_idx: row_idx for row_idx, abs_idx in enumerate(index_values)
-        }
-        self._current_episode_table = table
-        self._current_episode_cache = episode_cache
-        return table
 
     def _check_local_episodes_sufficient(
         self,
-        meta: LeRobotDatasetMetadata,
+        meta: LeRobotTrainingDatasetMetadata,
     ) -> bool:
         requested_episodes = (
             set(range(meta.total_episodes))
@@ -359,21 +368,6 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         if self.decode_camera_streams is None:
             return list(self.video_keys)
         return [key for key in self.video_keys if key in self.decode_camera_streams]
-    
-    def _episode_local_index(self, abs_idx: int, episode_cache: dict) -> int:
-        if self._current_index_to_row is None:
-            raise RuntimeError(
-                f"No index-to-row mapping cached for episode {episode_cache['episode_index']} "
-                f"and parquet file {episode_cache['parquet_path']}"
-            )
-
-        try:
-            return self._current_index_to_row[abs_idx]
-        except KeyError as e:
-            raise KeyError(
-                f"Absolute index {abs_idx} not found in episode {episode_cache['episode_index']} "
-                f"for parquet file {episode_cache['parquet_path']}"
-            ) from e
 
     def _arrow_scalar_to_python(self, value):
         if hasattr(value, "as_py"):
@@ -421,31 +415,28 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
 
     def _get_query_timestamps(
         self,
-        episode_table: pa.Table,
-        episode_cache: dict,
+        rows_table: pa.Table,
+        row_by_index: dict[int, int],
         current_ts: float,
         query_indices: dict[str, list[int]] | None = None,
     ) -> dict[str, list[float]]:
         query_timestamps = {}
-        ts_col = episode_table["timestamp"]
+        ts_col = rows_table["timestamp"]
 
         for key in self.video_keys:
             if query_indices is not None and key in query_indices:
-                local_indices = [
-                    self._episode_local_index(idx, episode_cache)
-                    for idx in query_indices[key]
-                ]
-                timestamps = pc.take(ts_col, pa.array(local_indices))
+                row_ids = [row_by_index[idx] for idx in query_indices[key]]
+                timestamps = pc.take(ts_col, pa.array(row_ids))
                 query_timestamps[key] = [x.as_py() for x in timestamps]
             else:
                 query_timestamps[key] = [current_ts]
 
         return query_timestamps
 
-    def _query_episode_table(
+    def _query_rows_table(
         self,
-        episode_table: pa.Table,
-        episode_cache: dict,
+        rows_table: pa.Table,
+        row_by_index: dict[int, int],
         query_indices: dict[str, list[int]],
     ) -> dict:
         result = {}
@@ -454,17 +445,10 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             if key in self.video_keys:
                 continue
 
-            local_indices = [
-                self._episode_local_index(idx, episode_cache)
-                for idx in q_idx
-            ]
-            taken = pc.take(episode_table[key], pa.array(local_indices))
+            row_ids = [row_by_index[idx] for idx in q_idx]
+            taken = pc.take(rows_table[key], pa.array(row_ids))
             values = [self._arrow_scalar_to_python(x) for x in taken]
-
-            if len(values) > 0 and isinstance(values[0], list):
-                result[key] = torch.tensor(values)
-            else:
-                result[key] = torch.tensor(values)
+            result[key] = torch.tensor(values)
 
         return result
 
@@ -492,36 +476,54 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
 
         return item
 
+    def _episode_idx_from_abs_idx(self, abs_idx: int) -> int:
+        ep_idx = bisect_right(self._episode_starts, abs_idx) - 1
+        if ep_idx < 0 or abs_idx >= self._episode_ends[ep_idx]:
+            raise IndexError(f"Index out of bounds: {abs_idx}")
+        return ep_idx
+
     def __len__(self) -> int:
         return self.num_frames
 
     def __getitem__(self, idx) -> dict:
         abs_idx = idx
 
-        ep_idx = self._abs_idx_to_episode_idx.get(abs_idx)
-        if ep_idx is None:
-            raise IndexError(f"Index out of bounds: {idx}")
+        ep_idx = self._episode_idx_from_abs_idx(abs_idx)
 
         episode_cache = self._get_current_episode_cache(ep_idx)
-        episode_table = self._ensure_current_episode_table(episode_cache)
-
-        local_idx = self._episode_local_index(abs_idx, episode_cache)
-        item = self._table_row_to_item(episode_table, local_idx)
 
         query_indices = None
+        padding = {}
+        needed_indices = [abs_idx]
+
         if self.delta_indices is not None:
             query_indices, padding = self._get_query_indices(abs_idx, episode_cache)
-            query_result = self._query_episode_table(episode_table, episode_cache, query_indices)
+            for q_idx in query_indices.values():
+                needed_indices.extend(q_idx)
+
+        rows_table, row_by_index = self._read_rows_for_abs_indices(
+            episode_cache,
+            needed_indices,
+        )
+
+        item = self._table_row_to_item(rows_table, row_by_index[abs_idx])
+
+        if query_indices is not None:
+            query_result = self._query_rows_table(rows_table, row_by_index, query_indices)
             item = {**item, **padding, **query_result}
 
         decode_video_keys = self._get_decode_video_keys()
         if len(decode_video_keys) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(
-                episode_table, episode_cache, current_ts, query_indices
+                rows_table,
+                row_by_index,
+                current_ts,
+                query_indices,
             )
             query_timestamps = {
-                key: value for key, value in query_timestamps.items()
+                key: value
+                for key, value in query_timestamps.items()
                 if key in decode_video_keys
             }
 
