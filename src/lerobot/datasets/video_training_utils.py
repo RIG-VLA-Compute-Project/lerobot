@@ -16,8 +16,10 @@
 import importlib
 import logging
 import warnings
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Any, ClassVar
 
 import av
@@ -117,12 +119,68 @@ def get_safe_default_codec():
         return "pyav"
 
 
+class VideoDecoderCache:
+    """Small explicit cache for torchcodec decoders owned by a dataset instance."""
+
+    def __init__(self) -> None:
+        self._decoders: dict[tuple[str, tuple[int, int] | None], VideoDecoder] = {}
+        self._lock = Lock()
+
+    def get_decoder(
+        self,
+        video_path: Path | str,
+        shape: tuple[int, int] | None = None,
+    ) -> VideoDecoder:
+        path = str(video_path)
+        shape_key = tuple(shape) if shape is not None else None
+        key = (path, shape_key)
+
+        with self._lock:
+            decoder = self._decoders.get(key)
+            if decoder is None:
+                transforms = [Resize(shape_key)] if shape_key is not None else None
+                decoder = VideoDecoder(
+                    path,
+                    seek_mode="approximate",
+                    num_ffmpeg_threads=1,
+                    transforms=transforms,
+                )
+                self._decoders[key] = decoder
+
+            return decoder
+
+    def clear(self) -> None:
+        with self._lock:
+            decoders = list(self._decoders.values())
+            self._decoders.clear()
+
+        self._close_decoders(decoders)
+
+    def clear_except_paths(self, video_paths: Iterable[Path | str]) -> None:
+        keep_paths = {str(video_path) for video_path in video_paths}
+        with self._lock:
+            stale_keys = [key for key in self._decoders if key[0] not in keep_paths]
+            decoders = [self._decoders.pop(key) for key in stale_keys]
+
+        self._close_decoders(decoders)
+
+    def _close_decoders(self, decoders: list[VideoDecoder]) -> None:
+        for decoder in decoders:
+            close = getattr(decoder, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    logger.debug("Failed to close cached VideoDecoder", exc_info=True)
+
+
 def decode_video_frames(
     video_path: Path | str,
     timestamps: list[float],
     tolerance_s: float,
     backend: str | None = None,
     shape: tuple[int, int] | None = None,
+    decoder_cache: VideoDecoderCache | None = None,
 ) -> torch.Tensor:
     """
     Decodes video frames using the specified backend.
@@ -133,6 +191,7 @@ def decode_video_frames(
         tolerance_s (float): Allowed deviation in seconds for frame retrieval.
         backend (str, optional): Backend to use for decoding. Defaults to "torchcodec" when available in the platform; otherwise, defaults to "pyav"..
         shape (tuple[int, int], optional): Target HxW shape for the decoded frames. Only supported with torchcodec backend.
+        decoder_cache (VideoDecoderCache, optional): Reuses torchcodec decoders across calls.
 
     Returns:
         torch.Tensor: Decoded frames.
@@ -142,7 +201,13 @@ def decode_video_frames(
     if backend is None:
         backend = get_safe_default_codec()
     if backend == "torchcodec":
-        return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s, shape=shape)
+        return decode_video_frames_torchcodec(
+            video_path,
+            timestamps,
+            tolerance_s,
+            decoder_cache=decoder_cache,
+            shape=shape,
+        )
     elif backend in ["pyav", "video_reader"]:
         return decode_video_frames_torchvision(video_path, timestamps, tolerance_s, backend)
     else:
@@ -263,7 +328,7 @@ def decode_video_frames_torchcodec(
     timestamps: list[float],
     tolerance_s: float,
     log_loaded_timestamps: bool = False,
-    decoder_cache = None,
+    decoder_cache: VideoDecoderCache | None = None,
     shape: tuple[int, int] | None = None,
 ) -> torch.Tensor:
     """Loads frames associated with the requested timestamps of a video using torchcodec.
@@ -273,7 +338,7 @@ def decode_video_frames_torchcodec(
         timestamps: List of timestamps to extract frames.
         tolerance_s: Allowed deviation in seconds for frame retrieval.
         log_loaded_timestamps: Whether to log loaded timestamps.
-        decoder_cache: Optional decoder cache instance. Uses default if None.
+        decoder_cache: Optional decoder cache instance.
         shape: Optional target HxW shape for the decoded frames.
 
     Note: Setting device="cuda" outside the main process, e.g. in data loader workers, will lead to CUDA initialization errors.
@@ -285,8 +350,16 @@ def decode_video_frames_torchcodec(
     can be adjusted during encoding to take into account decoding time and video size in bytes.
     """
 
-    transforms = [Resize(shape)] if shape is not None else None
-    decoder = VideoDecoder(str(video_path), seek_mode="approximate", num_ffmpeg_threads=1, transforms=transforms)
+    if decoder_cache is None:
+        transforms = [Resize(shape)] if shape is not None else None
+        decoder = VideoDecoder(
+            str(video_path),
+            seek_mode="approximate",
+            num_ffmpeg_threads=1,
+            transforms=transforms,
+        )
+    else:
+        decoder = decoder_cache.get_decoder(video_path, shape=shape)
 
     loaded_ts = []
     loaded_frames = []

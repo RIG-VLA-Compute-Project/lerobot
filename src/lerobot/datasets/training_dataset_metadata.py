@@ -28,18 +28,33 @@ class _EpisodeRows:
     Supports:
       - len(meta.episodes)
       - meta.episodes[ep_idx] -> dict[str, python_scalar_or_list]
+      - meta.episodes[column_name] -> list[python_scalar_or_list]
+      - meta.episodes.to_pandas()
     """
 
     def __init__(self, table: pa.Table):
         self._table = table
         self.column_names = tuple(table.column_names)
+        self._column_cache: dict[str, list] = {}
+        self._row_cache: dict[int, dict] = {}
+        self._pandas_cache: pd.DataFrame | None = None
 
     def __len__(self) -> int:
         return self._table.num_rows
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx: int | str | slice) -> dict | list:
+        if isinstance(idx, str):
+            if idx not in self.column_names:
+                raise KeyError(idx)
+            if idx not in self._column_cache:
+                self._column_cache[idx] = self._table[idx].to_pylist()
+            return self._column_cache[idx]
+
+        if isinstance(idx, slice):
+            return [self[row_idx] for row_idx in range(*idx.indices(self._table.num_rows))]
+
         if not isinstance(idx, int):
-            raise TypeError(f"Episode index must be int, got {type(idx)}")
+            raise TypeError(f"Episode index must be int, str, or slice, got {type(idx)}")
 
         if idx < 0:
             idx += self._table.num_rows
@@ -47,23 +62,32 @@ class _EpisodeRows:
         if idx < 0 or idx >= self._table.num_rows:
             raise IndexError(f"Episode index {idx} out of range")
 
+        if idx in self._row_cache:
+            return self._row_cache[idx]
+
         row = {}
         for key in self.column_names:
             value = self._table[key][idx]
             row[key] = value.as_py() if hasattr(value, "as_py") else value
+        self._row_cache[idx] = row
         return row
+
+    def __iter__(self):
+        for idx in range(self._table.num_rows):
+            yield self[idx]
+
+    def to_pandas(self) -> pd.DataFrame:
+        if self._pandas_cache is None:
+            self._pandas_cache = self._table.to_pandas()
+        return self._pandas_cache
 
 
 class LeRobotTrainingDatasetMetadata:
     """
-    Slim, read-only, local-only metadata loader for training.
-
-    Key properties:
-      - no snapshot_download
-      - no Hugging Face Dataset.from_parquet
-      - no HF cache writes
-      - full episode metadata kept intact
+    Cacheless metadata loader for training.
     """
+
+    EXCLUDED_EPISODE_COLUMN_PREFIXES = ("stats/",)
 
     def __init__(
         self,
@@ -122,7 +146,12 @@ class LeRobotTrainingDatasetMetadata:
 
     def _load_episodes_table(self) -> pa.Table:
         paths = self._episode_paths()
-        return pq.read_table([str(path) for path in paths])
+        columns = [
+            name
+            for name in pq.read_schema(paths[0]).names
+            if not name.startswith(self.EXCLUDED_EPISODE_COLUMN_PREFIXES)
+        ]
+        return pq.read_table([str(path) for path in paths], columns=columns)
 
     @property
     def _version(self) -> packaging.version.Version:

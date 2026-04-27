@@ -15,7 +15,11 @@ from lerobot.datasets.feature_utils import (
     check_delta_timestamps,
     get_delta_indices,
 )
-from lerobot.datasets.video_training_utils import decode_video_frames, get_safe_default_codec
+from lerobot.datasets.video_training_utils import (
+    VideoDecoderCache,
+    decode_video_frames,
+    get_safe_default_codec,
+)
 from lerobot.utils.constants import HF_LEROBOT_HOME
 
 
@@ -47,7 +51,12 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         self._current_parquet_path: Path | None = None
         self._current_parquet_file: pq.ParquetFile | None = None
         self._current_row_group_locator: list[tuple[int, int, int]] | None = None
+        self._parquet_index_bounds_cache: dict[Path, tuple[int, int]] = {}
+        self._current_rows_cache_key: tuple[Path, tuple[int, ...]] | None = None
+        self._current_rows_table: pa.Table | None = None
+        self._current_rows_index_to_row: dict[int, int] | None = None
         self._keep_columns: list[str] | None = None
+        self._video_decoder_cache = VideoDecoderCache()
 
         if not self.root.exists():
             raise FileNotFoundError(f"Dataset root does not exist: {self.root}")
@@ -57,7 +66,8 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         self._episode_starts: list[int] = []
         self._episode_ends: list[int] = []
 
-        meta = self._open_meta()
+        self.meta = self._open_meta()
+        meta = self.meta
         try:
             self._fps = meta.fps
             self._features = meta.features
@@ -112,68 +122,96 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         if self._current_episode_idx == episode_idx and self._current_episode_cache is not None:
             return self._current_episode_cache
 
-        meta = self._open_meta()
-        try:
-            ep = meta.episodes[episode_idx]
-            decode_video_keys = self._get_decode_video_keys()
+        meta = self.meta
+        ep = meta.episodes[episode_idx]
+        decode_video_keys = self._get_decode_video_keys()
 
-            def scalar(x):
-                return x.item() if isinstance(x, torch.Tensor) else x
+        def scalar(x):
+            return x.item() if isinstance(x, torch.Tensor) else x
 
-            chunk_index = scalar(ep["data/chunk_index"])
-            file_index = scalar(ep["data/file_index"])
-            dataset_from_index = scalar(ep["dataset_from_index"])
-            dataset_to_index = scalar(ep["dataset_to_index"])
+        chunk_index = scalar(ep["data/chunk_index"])
+        file_index = scalar(ep["data/file_index"])
+        dataset_from_index = scalar(ep["dataset_from_index"])
+        dataset_to_index = scalar(ep["dataset_to_index"])
 
-            parquet_path = self.root / meta.data_path.format(
+        parquet_path = self.root / meta.data_path.format(
+            chunk_index=chunk_index,
+            file_index=file_index,
+        )
+
+        # TODO - this seems to be necessary for AgiBotWorldBeta specifically.
+        # Maybe this is an issue for any dataset which at some point used the official lerobot conversion code?
+        # In any case we should harden this to wrap around the chunk index too
+        if not self._parquet_contains_index(parquet_path, dataset_from_index):
+            next_parquet_path = self.root / meta.data_path.format(
                 chunk_index=chunk_index,
-                file_index=file_index,
+                file_index=file_index + 1,
             )
 
-            # TODO - this seems to be necessary for AgiBotWorldBeta specifically.
-            # Maybe this is an issue for any dataset which at some point used the official lerobot conversion code?
-            # In any case we should harden this to wrap around the chunk index too
-            if not self._parquet_contains_index(parquet_path, dataset_from_index):
-                next_parquet_path = self.root / meta.data_path.format(
-                    chunk_index=chunk_index,
-                    file_index=file_index + 1,
+            if self._parquet_contains_index(next_parquet_path, dataset_from_index):
+                parquet_path = next_parquet_path
+            else:
+                raise RuntimeError(
+                    f"Could not locate dataset_from_index={dataset_from_index} "
+                    f"for episode {episode_idx} in metadata parquet file {parquet_path} "
+                    f"or fallback parquet file {next_parquet_path}"
                 )
 
-                if self._parquet_contains_index(next_parquet_path, dataset_from_index):
-                    parquet_path = next_parquet_path
-                else:
-                    raise RuntimeError(
-                        f"Could not locate dataset_from_index={dataset_from_index} "
-                        f"for episode {episode_idx} in metadata parquet file {parquet_path} "
-                        f"or fallback parquet file {next_parquet_path}"
-                    )
+        cache = {
+            "dataset_from_index": dataset_from_index,
+            "dataset_to_index": dataset_to_index,
+            "episode_length": dataset_to_index - dataset_from_index,
+            "parquet_path": parquet_path,
+            "episode_index": episode_idx,
+            "video_from_timestamps": {
+                vid_key: scalar(ep[f"videos/{vid_key}/from_timestamp"])
+                for vid_key in decode_video_keys
+            },
+            "video_paths": {
+                vid_key: self.root / meta.video_path.format(
+                    video_key=vid_key,
+                    chunk_index=scalar(ep[f"videos/{vid_key}/chunk_index"]),
+                    file_index=scalar(ep[f"videos/{vid_key}/file_index"]),
+                )
+                for vid_key in decode_video_keys
+            },
+        }
 
-            cache = {
-                "dataset_from_index": dataset_from_index,
-                "dataset_to_index": dataset_to_index,
-                "episode_length": dataset_to_index - dataset_from_index,
-                "parquet_path": parquet_path,
-                "episode_index": episode_idx,
-                "video_from_timestamps": {
-                    vid_key: scalar(ep[f"videos/{vid_key}/from_timestamp"])
-                    for vid_key in decode_video_keys
-                },
-                "video_paths": {
-                    vid_key: self.root / meta.get_video_file_path(episode_idx, vid_key)
-                    for vid_key in decode_video_keys
-                },
-            }
+        if self._current_episode_cache is not None:
+            self._video_decoder_cache.clear_except_paths(cache["video_paths"].values())
 
-            if self._current_episode_idx != episode_idx or self._current_parquet_path != parquet_path:
-                self._current_parquet_path = None
-                self._current_parquet_file = None
-                self._current_row_group_locator = None
+        if self._current_parquet_path is not None and self._current_parquet_path != parquet_path:
+            self._clear_current_parquet_state()
 
-            self._current_episode_idx = episode_idx
-            self._current_episode_cache = cache
-            return cache
-        finally:
-            del meta
+        self._current_episode_idx = episode_idx
+        self._current_episode_cache = cache
+        return cache
+
+    def _clear_current_rows_cache(self) -> None:
+        self._current_rows_cache_key = None
+        self._current_rows_table = None
+        self._current_rows_index_to_row = None
+
+    def _clear_current_parquet_state(self) -> None:
+        parquet_file = self._current_parquet_file
+        if parquet_file is not None:
+            close = getattr(parquet_file, "close", None)
+            if close is not None:
+                close()
+
+        self._current_parquet_path = None
+        self._current_parquet_file = None
+        self._current_row_group_locator = None
+        self._clear_current_rows_cache()
+
+    def _clear_video_decoder_cache(self) -> None:
+        decoder_cache = getattr(self, "_video_decoder_cache", None)
+        if decoder_cache is not None:
+            decoder_cache.clear()
+
+    def __del__(self):
+        self._clear_video_decoder_cache()
+        self._clear_current_parquet_state()
 
     def _ensure_current_parquet_locator(
         self,
@@ -188,6 +226,7 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         ):
             return self._current_parquet_file, self._current_row_group_locator
 
+        self._clear_current_parquet_state()
         parquet_file = pq.ParquetFile(parquet_path)
 
         available_columns = set(parquet_file.schema_arrow.names)
@@ -232,31 +271,37 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         if len(target_indices) == 0:
             raise ValueError("No indices requested")
 
-        lo = target_indices[0]
-        hi = target_indices[-1]
-
         needed_row_groups = [
             rg_idx
             for rg_min, rg_max, rg_idx in locator
-            if rg_max >= lo and rg_min <= hi
+            if any(rg_min <= target_idx <= rg_max for target_idx in target_indices)
         ]
         if len(needed_row_groups) == 0:
             raise RuntimeError(
-                f"No row groups found for requested indices {lo}..{hi} "
+                f"No row groups found for requested indices {target_indices[:10]} "
                 f"in {episode_cache['parquet_path']}"
             )
 
-        table = parquet_file.read_row_groups(
-            needed_row_groups,
-            columns=self._keep_columns,
-        )
+        rows_cache_key = (episode_cache["parquet_path"], tuple(needed_row_groups))
+        if (
+            self._current_rows_cache_key == rows_cache_key
+            and self._current_rows_table is not None
+            and self._current_rows_index_to_row is not None
+        ):
+            table = self._current_rows_table
+            row_by_index = self._current_rows_index_to_row
+        else:
+            table = parquet_file.read_row_groups(
+                needed_row_groups,
+                columns=self._keep_columns,
+            )
 
-        index_array = table["index"]
-        mask = pc.is_in(index_array, value_set=pa.array(target_indices, type=index_array.type))
-        table = table.filter(mask)
+            index_values = table["index"].to_pylist()
+            row_by_index = {abs_idx: row_idx for row_idx, abs_idx in enumerate(index_values)}
 
-        index_values = table["index"].to_pylist()
-        row_by_index = {abs_idx: row_idx for row_idx, abs_idx in enumerate(index_values)}
+            self._current_rows_cache_key = rows_cache_key
+            self._current_rows_table = table
+            self._current_rows_index_to_row = row_by_index
 
         missing = [abs_idx for abs_idx in target_indices if abs_idx not in row_by_index]
         if missing:
@@ -271,14 +316,48 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         if not parquet_path.exists():
             return False
 
-        parquet_file = pq.ParquetFile(parquet_path)
-        index_table = parquet_file.read(columns=["index"])
-        index_values = index_table.column("index").to_pylist()
-
-        if len(index_values) == 0:
+        bounds = self._parquet_index_bounds(parquet_path)
+        if bounds is None:
             return False
 
-        return index_values[0] <= target_index <= index_values[-1]
+        min_index, max_index = bounds
+        return min_index <= target_index <= max_index
+
+    def _parquet_index_bounds(self, parquet_path: Path) -> tuple[int, int] | None:
+        cached = self._parquet_index_bounds_cache.get(parquet_path)
+        if cached is not None:
+            return cached
+
+        parquet_file = pq.ParquetFile(parquet_path)
+        try:
+            try:
+                index_col_idx = parquet_file.schema_arrow.names.index("index")
+            except ValueError as e:
+                raise KeyError(f"'index' column not found in parquet file: {parquet_path}") from e
+
+            mins = []
+            maxes = []
+            for rg_idx in range(parquet_file.metadata.num_row_groups):
+                col_meta = parquet_file.metadata.row_group(rg_idx).column(index_col_idx)
+                stats = col_meta.statistics
+                if stats is None or stats.min is None or stats.max is None:
+                    raise RuntimeError(
+                        f"Parquet row-group statistics for 'index' are missing in {parquet_path}. "
+                        "Training dataset uses min/max row-group stats for sparse reads."
+                    )
+                mins.append(int(stats.min))
+                maxes.append(int(stats.max))
+        finally:
+            close = getattr(parquet_file, "close", None)
+            if close is not None:
+                close()
+
+        if len(mins) == 0:
+            return None
+
+        bounds = (min(mins), max(maxes))
+        self._parquet_index_bounds_cache[parquet_path] = bounds
+        return bounds
 
     def _check_local_episodes_sufficient(
         self,
@@ -304,7 +383,11 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
                 return False
 
             for vid_key in required_video_keys:
-                video_path = self.root / meta.get_video_file_path(ep_idx, vid_key)
+                video_path = self.root / meta.video_path.format(
+                    video_key=vid_key,
+                    chunk_index=scalar(ep[f"videos/{vid_key}/chunk_index"]),
+                    file_index=scalar(ep[f"videos/{vid_key}/file_index"]),
+                )
                 if not video_path.exists():
                     return False
 
@@ -335,9 +418,7 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         return self._camera_keys
 
     def get_episode_info(self, episode_idx: int):
-        meta = self._open_meta()
-        ep = meta.episodes[episode_idx]
-        return ep
+        return self.meta.episodes[episode_idx]
 
     def get_episode_len(self, episode_idx: int) -> int:
         ep = self.get_episode_info(episode_idx)
@@ -471,6 +552,7 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
                 self.tolerance_s,
                 self.video_backend,
                 shape=video_hw,
+                decoder_cache=self._video_decoder_cache,
             )
             item[vid_key] = frames.squeeze(0)
 
