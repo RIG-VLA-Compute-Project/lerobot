@@ -262,12 +262,18 @@ class _PersistentVideoDecoderCache(VideoDecoderCache):
         shape_key = tuple(shape) if shape is not None else None
         key = (path_str, shape_key)
 
-        # Fast path: existing decoder.
+        # Fast path: read the decoder reference under self._lock, then
+        # RELEASE before touching the LRU. _maybe_evict acquires the two
+        # locks in the opposite order (self._lru_lock then self._lock), so
+        # nesting them here would deadlock the moment two threads hit
+        # get_decoder concurrently — one cache-hit and one cache-miss
+        # whose eviction sweep needs self._lock back.
+        cached_decoder = None
         with self._lock:
-            decoder = self._decoders.get(key)
-            if decoder is not None:
-                self._touch_lru(key)
-                return decoder
+            cached_decoder = self._decoders.get(key)
+        if cached_decoder is not None:
+            self._touch_lru(key)
+            return cached_decoder
 
         # Cache miss. Prefetch the mp4 into page cache before any NFS read
         # from ffmpeg.
