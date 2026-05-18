@@ -2,57 +2,78 @@
 
 """Cluster-optimized LeRobotTrainingDataset for the marigold_data workload.
 
-Designed for ``multiprocessing_context="forkserver"`` data loaders running on
-a shared filesystem with hundreds of workers per node and thousands across the
-cluster. Each worker gets a handful of subdatasets via a sharding plan;
-``max_active_subdatasets`` is left at the default (``None``), so every dataset
-the worker is assigned to lives for the whole worker lifetime.
+Designed for shared-filesystem deployments where many workers across many
+nodes read from one NFS server. Optimisations are layered onto the cacheless
+``LeRobotTrainingDataset`` and target the actual steady-state and startup
+bottlenecks observed in 8-node jobs.
 
-Five optimisations layered on top of the cacheless ``LeRobotTrainingDataset``:
+Steady-state (per ``__getitem__``):
 
-  1. **Worker-wide shared parquet LRU.** A single module-level
-     ``_ParquetTableLRU`` is shared by all ``LeRobotTrainingDataset`` instances
-     in a worker process. With forkserver each worker is its own process, so
-     "module-level" == "per-worker", and the bound on total parquet RAM is one
-     number per worker rather than ``per_instance_size × num_instances``.
+  1. **mp4 prefetch into the OS page cache on first decoder open** (opt-in via
+     ``LEROBOT_PREFETCH_MP4``). LeRobot 3.0 puts many episodes into one mp4,
+     so one big sequential NFS read converts the subsequent many-small-seeks-
+     from-ffmpeg access pattern into page-cache hits. Disproportionately
+     helps multi-node jobs because NFS RPC overhead is what gets multiplied
+     by node count.
 
-  2. **Worker-wide shared video decoder cache** with the same scoping. Bounded
-     by default — every distinct mp4 ever touched does NOT stay open forever,
-     which was the source of the long-step memory growth in the 8-node job.
+  2. **Parallel multi-camera video decode** via a small thread pool. Each
+     camera's decoder is a separate object on a separate mp4, so concurrent
+     decodes are safe; this issues N concurrent NFS reads instead of N
+     serial ones. The HF variant has done this for a while; we now do too.
 
-  3. **Decoders never evicted on episode transition.** LeRobot 3.0 reuses mp4
-     files across multiple episodes per camera; evicting on the per-episode
-     boundary just reopens the same NFS handle moments later. Eviction is
-     governed by the LRU cap only, not episode hops.
+  3. **Bounded video decoder LRU** keyed by mp4 path. Decoders are *not*
+     evicted on episode transitions because consecutive episodes typically
+     share the same mp4 in LeRobot 3.0. Eviction is governed only by the
+     LRU cap.
 
-  4. **Fast startup.** ``_check_local_episodes_sufficient`` previously stat'd
-     every (episode × camera + episode) path — millions of NFS metadata
-     ops cluster-wide. We now (a) deduplicate paths before stat'ing, which
-     for a multi-episode-chunk layout drops the work by 2–3 orders of
-     magnitude, and (b) honor the ``LEROBOT_SKIP_FILE_CHECK`` env var to skip
-     the check entirely. Per-episode bookkeeping at init is built from bulk
-     pyarrow column reads instead of one-dict-per-episode iteration.
+  4. **Bounded parquet table LRU**. Whole parquet read into RAM on first
+     access, all subsequent accesses to any row of that parquet are pure
+     RAM lookups. Bound stops memory growth.
 
-  5. **Vectorised delta-timestamp reads via ``pc.take``.** Per-``__getitem__``
-     CPU win when the policy uses long proprio/action windows.
+  5. **Vectorised delta-timestamp reads via ``pc.take``** so a query of 20
+     anchor offsets becomes one columnar arrow op per column, not a Python
+     row-by-row loop.
 
-Public interface matches the cacheless ``LeRobotTrainingDataset`` exactly.
+Startup (per ``__init__``):
 
-Tunable env vars (all per worker process):
+  6. **Dedup the per-episode file-existence check** before stat'ing. With
+     multi-episode-per-chunk layout, ``data/<chunk>/<file>.parquet`` and
+     ``videos/<key>/<chunk>/<file>.mp4`` paths are shared across many
+     episodes; the previous implementation stat'd them once per episode.
+     We now stat each unique path once. The check can also be skipped
+     entirely with ``LEROBOT_SKIP_FILE_CHECK``.
+
+  7. **Bulk pyarrow column loads** to build the per-episode arrays in one
+     shot instead of materialising one dict per episode.
+
+Caches are module-level so a process has one parquet LRU and one decoder LRU
+regardless of how many ``LeRobotTrainingDataset`` instances it holds. Module
+globals are scoped to the process; this works correctly under any
+multiprocessing context the data loader chooses.
+
+Tunable env vars (all per process):
   LEROBOT_PARQUET_CACHE_SIZE          (default 4)    parquet tables held in RAM
   LEROBOT_VIDEO_DECODER_CACHE_SIZE    (default 64)   open video decoders
   LEROBOT_SKIP_FILE_CHECK             (default 0)    skip per-file stat check
+  LEROBOT_PREFETCH_MP4                (default 0)    page-cache prefetch on
+                                                     first decoder open
+  LEROBOT_VIDEO_DECODE_THREADS        (default = num cameras, cap 8)
+                                                     thread pool size for
+                                                     parallel multi-camera
+                                                     decode; set to 0/1 to
+                                                     disable threading.
 
 LeRobot 3.0 layout invariants used by this design:
   * Multiple episodes can share a parquet file. The parquet LRU is keyed by
     *path*, not episode, so all episodes within a parquet share one entry.
   * Multiple episodes can share an mp4 per camera. Each episode stores
-    ``videos/<key>/from_timestamp``; query timestamps are shifted accordingly.
-    The decoder cache is keyed by mp4 path, so shared mp4s share a decoder.
+    ``videos/<key>/from_timestamp``; query timestamps are shifted
+    accordingly. The decoder cache is keyed by mp4 path.
 """
 
 import os
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -81,6 +102,65 @@ from lerobot.utils.constants import HF_LEROBOT_HOME
 
 
 # ---------------------------------------------------------------------------
+# Env-var helpers
+# ---------------------------------------------------------------------------
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_PARQUET_CACHE_SIZE = _env_int("LEROBOT_PARQUET_CACHE_SIZE", 4)
+_VIDEO_DECODER_CACHE_SIZE = _env_int("LEROBOT_VIDEO_DECODER_CACHE_SIZE", 64)
+_SKIP_FILE_CHECK = _env_flag("LEROBOT_SKIP_FILE_CHECK", default=False)
+_PREFETCH_MP4 = _env_flag("LEROBOT_PREFETCH_MP4", default=False)
+_VIDEO_DECODE_THREADS = _env_int("LEROBOT_VIDEO_DECODE_THREADS", 0)
+
+
+# ---------------------------------------------------------------------------
+# mp4 page-cache prefetch
+# ---------------------------------------------------------------------------
+
+
+def _prefetch_into_page_cache(path: Path) -> None:
+    """Read the file once with sequential-read advice to warm the OS page
+    cache. Bytes are not retained in the Python heap; they live only in the
+    OS page cache, where they'll be served on subsequent decoder reads
+    without an NFS round trip.
+
+    Best-effort: any IO error is swallowed (the worst case is that the
+    decoder open later in the call path fails with a clearer error).
+    """
+    BUF = 4 << 20  # 4 MiB
+    try:
+        with open(path, "rb") as f:
+            fd = f.fileno()
+            if hasattr(os, "posix_fadvise"):
+                try:
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_WILLNEED)
+                except OSError:
+                    pass
+            while f.read(BUF):
+                pass
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Cache types
 # ---------------------------------------------------------------------------
 
@@ -89,9 +169,9 @@ from lerobot.utils.constants import HF_LEROBOT_HOME
 class _CachedTable:
     """A parquet table loaded into RAM plus an ``abs_index → row_idx`` map.
 
-    The map handles multi-episode parquets (LeRobot 3.0): all rows from all
-    episodes in the parquet are indexed in one dict. The 'index' column is
-    globally unique across a LeRobot dataset, so the map is unambiguous.
+    Handles multi-episode parquets (LeRobot 3.0): the 'index' column is
+    globally unique in a LeRobot dataset, so the map covers every row from
+    every episode in this parquet without ambiguity.
     """
 
     table: pa.Table
@@ -139,8 +219,6 @@ class _ParquetTableLRU:
                 self._entries.move_to_end(path)
                 return cached
 
-        # Cache miss: read outside the lock so other paths can be served in
-        # parallel.
         cached = _read_and_index(path, columns)
 
         with self._lock:
@@ -160,35 +238,71 @@ class _ParquetTableLRU:
 
 
 class _PersistentVideoDecoderCache(VideoDecoderCache):
-    """VideoDecoderCache that does NOT evict on episode transitions and is
+    """VideoDecoderCache that does not evict on episode transitions and is
     bounded by an explicit total-decoder LRU cap.
 
-    LeRobot 3.0 shares mp4 files across multiple episodes per camera; closing
-    a decoder on every episode hop would re-open the exact same NFS handle a
-    few samples later. Eviction is instead driven by the configured cap.
+    On a miss, optionally prefetches the mp4 into the OS page cache before
+    creating the decoder, so that ffmpeg's subsequent seek/read pattern is
+    served from RAM rather than NFS.
     """
 
-    def __init__(self, max_open_decoders: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        max_open_decoders: Optional[int] = None,
+        prefetch: bool = False,
+    ) -> None:
         super().__init__()
         self._max_open_decoders = max_open_decoders
+        self._prefetch = prefetch
         self._lru: OrderedDict = OrderedDict()
         self._lru_lock = Lock()
 
     def get_decoder(self, video_path, shape=None):
+        path_str = str(video_path)
+        shape_key = tuple(shape) if shape is not None else None
+        key = (path_str, shape_key)
+
+        # Fast path: existing decoder.
+        with self._lock:
+            decoder = self._decoders.get(key)
+            if decoder is not None:
+                self._touch_lru(key)
+                return decoder
+
+        # Cache miss. Prefetch the mp4 into page cache before any NFS read
+        # from ffmpeg.
+        if self._prefetch:
+            _prefetch_into_page_cache(Path(video_path))
+
+        # Delegate decoder creation to the parent class (still locks
+        # internally and handles the double-check). The parent will read
+        # the (now-cached) mp4 to populate its own state.
         decoder = super().get_decoder(video_path, shape=shape)
-        if self._max_open_decoders is not None:
-            key = (str(video_path), tuple(shape) if shape is not None else None)
-            with self._lru_lock:
-                if key in self._lru:
-                    self._lru.move_to_end(key)
-                else:
-                    self._lru[key] = None
-                while len(self._lru) > self._max_open_decoders:
-                    stale_key, _ = self._lru.popitem(last=False)
-                    self._evict_one(stale_key)
+
+        self._touch_lru(key)
+        self._maybe_evict()
         return decoder
 
-    def _evict_one(self, key: tuple[str, Optional[tuple[int, int]]]) -> None:
+    def _touch_lru(self, key: tuple) -> None:
+        if self._max_open_decoders is None:
+            return
+        with self._lru_lock:
+            if key in self._lru:
+                self._lru.move_to_end(key)
+            else:
+                self._lru[key] = None
+
+    def _maybe_evict(self) -> None:
+        if self._max_open_decoders is None:
+            return
+        with self._lru_lock:
+            while len(self._lru) > self._max_open_decoders:
+                stale_key, _ = self._lru.popitem(last=False)
+                self._evict_one_locked_outside(stale_key)
+
+    def _evict_one_locked_outside(self, key: tuple) -> None:
+        # Called while holding self._lru_lock. Decoder dict lock is acquired
+        # separately by parent.
         with self._lock:
             decoder = self._decoders.pop(key, None)
         if decoder is not None:
@@ -200,30 +314,8 @@ class _PersistentVideoDecoderCache(VideoDecoderCache):
 
 
 # ---------------------------------------------------------------------------
-# Module-level (per-worker-process) shared caches
+# Module-level (per-process) caches
 # ---------------------------------------------------------------------------
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        return default
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-_PARQUET_CACHE_SIZE = _env_int("LEROBOT_PARQUET_CACHE_SIZE", 4)
-_VIDEO_DECODER_CACHE_SIZE = _env_int("LEROBOT_VIDEO_DECODER_CACHE_SIZE", 64)
-_SKIP_FILE_CHECK = _env_flag("LEROBOT_SKIP_FILE_CHECK", default=False)
 
 
 _SHARED_PARQUET_CACHE: Optional[_ParquetTableLRU] = None
@@ -232,9 +324,9 @@ _SHARED_CACHE_INIT_LOCK = Lock()
 
 
 def _get_shared_caches() -> tuple[_ParquetTableLRU, _PersistentVideoDecoderCache]:
-    """Lazily construct the per-worker singletons used by every dataset in
-    this process. With forkserver, every worker is a fresh process, so each
-    one gets its own pair sized by the env vars above."""
+    """Lazily construct per-process singletons used by every dataset
+    instance in this process. Module globals are per-process; this is true
+    under any multiprocessing context the data loader chooses."""
     global _SHARED_PARQUET_CACHE, _SHARED_VIDEO_DECODER_CACHE
     if _SHARED_PARQUET_CACHE is not None and _SHARED_VIDEO_DECODER_CACHE is not None:
         return _SHARED_PARQUET_CACHE, _SHARED_VIDEO_DECODER_CACHE
@@ -244,6 +336,7 @@ def _get_shared_caches() -> tuple[_ParquetTableLRU, _PersistentVideoDecoderCache
         if _SHARED_VIDEO_DECODER_CACHE is None:
             _SHARED_VIDEO_DECODER_CACHE = _PersistentVideoDecoderCache(
                 max_open_decoders=_VIDEO_DECODER_CACHE_SIZE,
+                prefetch=_PREFETCH_MP4,
             )
     return _SHARED_PARQUET_CACHE, _SHARED_VIDEO_DECODER_CACHE
 
@@ -260,9 +353,9 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
     output shape as the cacheless ``LeRobotTrainingDataset``.
 
     The ``parquet_cache_size`` and ``max_open_video_decoders`` kwargs are
-    retained for source compatibility but are *not* per-instance anymore;
-    the operative bounds are the env vars listed at the top of this module
-    (one shared cache per worker process).
+    retained for source compatibility but are not per-instance; the
+    operative bounds are the env vars at the top of this module (one shared
+    cache per process).
     """
 
     def __init__(
@@ -295,11 +388,11 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         self._current_episode_idx: Optional[int] = None
         self._current_episode_cache: Optional[dict] = None
 
-        # Lazy per-episode path resolution state.
+        # Lazy per-episode path resolution.
         self._episode_resolved_paths: dict[int, Path] = {}
         self._path_resolution_lock = Lock()
 
-        # Per-worker shared caches.
+        # Per-process shared caches.
         self._parquet_cache, self._video_decoder_cache = _get_shared_caches()
 
         if not self.root.exists():
@@ -322,7 +415,6 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             self._validate_decode_camera_streams()
             self._meta_video_feature_keys = self._get_video_feature_keys_from_meta()
 
-            # Column projection.
             keep = set(self.required_keys) - self._meta_video_feature_keys
             keep |= {"episode_index", "index", "timestamp", "task_index"}
             if self._subtask_names is not None:
@@ -331,10 +423,6 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             if len(self._keep_columns) == 0:
                 raise ValueError("No parquet columns requested")
 
-            # Bulk-load per-episode bookkeeping from the metadata table.
-            # Avoids the previous per-episode dict materialisation, which
-            # iterated 20+ column lookups per episode (now 1 column lookup
-            # converted to numpy in one shot).
             self._load_episode_arrays(meta)
 
             self._num_frames = self._total_frames
@@ -350,6 +438,10 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
+        # Decode thread pool: lazy-init in _query_videos when we know how
+        # many cameras to decode and whether threading is enabled.
+        self._decode_pool: Optional[ThreadPoolExecutor] = None
+
     def _open_meta(self) -> LeRobotTrainingDatasetMetadata:
         return LeRobotTrainingDatasetMetadata(
             self.repo_id,
@@ -358,11 +450,8 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         )
 
     def _load_episode_arrays(self, meta: LeRobotTrainingDatasetMetadata) -> None:
-        """Build the per-episode arrays we need at access time, in one bulk
-        pyarrow column read each. Replaces the per-episode ``meta.episodes[ep]``
-        dict materialisation that the cacheless variant used in its init loop.
-        """
-        table = meta._episodes_table  # the in-RAM episode metadata table
+        """Build per-episode arrays via bulk pyarrow column reads."""
+        table = meta._episodes_table
 
         starts = table["dataset_from_index"].to_numpy(zero_copy_only=False)
         ends = table["dataset_to_index"].to_numpy(zero_copy_only=False)
@@ -375,8 +464,6 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
 
         data_path_fmt = meta.data_path
         root = self.root
-        # ``format`` is fast enough at this scale; vectorising it is not worth
-        # the complexity.
         self._episode_naive_paths: list[Path] = [
             root / data_path_fmt.format(
                 chunk_index=int(c),
@@ -449,20 +536,16 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         self,
         meta: LeRobotTrainingDatasetMetadata,
     ) -> bool:
-        """Stat-check that every required parquet and video file exists.
+        """Stat-check every required parquet and video file exists.
 
-        With LeRobot 3.0 multi-episode-per-chunk, most paths are shared across
-        episodes. We deduplicate paths from the bulk pyarrow columns and only
-        stat each unique path once. With ~10k episodes, ~50 chunks, and 3
-        cameras this drops the work from O(40k) to O(200) stat calls per
-        dataset.
-
-        Can be disabled entirely via the ``LEROBOT_SKIP_FILE_CHECK`` env var.
+        LeRobot 3.0 multi-episode-per-chunk means most paths repeat across
+        episodes. We deduplicate from bulk pyarrow column reads and stat
+        each unique path once. Can be disabled with
+        ``LEROBOT_SKIP_FILE_CHECK``.
         """
         required_video_keys = self._get_decode_video_keys()
         table = meta._episodes_table
 
-        # Unique parquet paths from the bulk-read chunk/file columns.
         data_chunks = table["data/chunk_index"].to_numpy(zero_copy_only=False)
         data_files = table["data/file_index"].to_numpy(zero_copy_only=False)
         unique_parquet_pairs = {(int(c), int(f)) for c, f in zip(data_chunks, data_files)}
@@ -475,7 +558,6 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             if not parquet_path.exists():
                 return False
 
-        # Unique video paths per camera key.
         for vid_key in required_video_keys:
             v_chunks = table[f"videos/{vid_key}/chunk_index"].to_numpy(zero_copy_only=False)
             v_files = table[f"videos/{vid_key}/file_index"].to_numpy(zero_copy_only=False)
@@ -495,15 +577,13 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             return list(self._video_keys)
         return [key for key in self._video_keys if key in self.decode_camera_streams]
 
-    # ---- Path resolution (lazy, cached per episode) ----
+    # ---- Path resolution ----
 
     def _resolve_episode_path(self, episode_idx: int) -> Path:
         """Return the parquet path for ``episode_idx``, applying the
-        ``file_index + 1`` fallback if needed.
-
-        Cached after first resolution. The fallback check uses parquet
-        row-group statistics (metadata-only NFS read).
-        """
+        ``file_index + 1`` fallback if needed. Cached after first
+        resolution. The fallback uses parquet row-group statistics
+        (metadata-only NFS read)."""
         resolved = self._episode_resolved_paths.get(episode_idx)
         if resolved is not None:
             return resolved
@@ -541,9 +621,6 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def _candidate_table_contains_index(path: Path, target_index: int) -> bool:
-        """Metadata-only check whether ``path`` is a parquet whose 'index'
-        column covers ``target_index``. Opens a ``pq.ParquetFile`` briefly to
-        read row-group statistics and closes it immediately."""
         if not path.exists():
             return False
 
@@ -605,9 +682,13 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         return cache
 
     def __del__(self):
-        # Do NOT clear the shared decoder cache here: other instances in this
-        # worker rely on it.
-        pass
+        # Shared caches outlive the instance — do not clear them here.
+        pool = getattr(self, "_decode_pool", None)
+        if pool is not None:
+            try:
+                pool.shutdown(wait=False)
+            except Exception:
+                pass
 
     # ---- Row materialisation ----
 
@@ -635,7 +716,7 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
                 item[key] = value
         return item
 
-    # ---- Delta-timestamp expansion (batched via pc.take) ----
+    # ---- Delta-timestamp expansion ----
 
     def _get_query_indices(
         self,
@@ -692,28 +773,67 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
 
         return result
 
+    # ---- Video query (parallel multi-camera) ----
+
+    def _decode_single_camera(
+        self,
+        vid_key: str,
+        query_ts: list[float],
+        episode_cache: dict,
+    ) -> tuple[str, torch.Tensor]:
+        from_timestamp = episode_cache["video_from_timestamps"][vid_key]
+        shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+        video_path = episode_cache["video_paths"][vid_key]
+        video_hw = self.videos_hw.get(vid_key, None) if self.videos_hw is not None else None
+        frames = decode_video_frames(
+            video_path,
+            shifted_query_ts,
+            self.tolerance_s,
+            self.video_backend,
+            shape=video_hw,
+            decoder_cache=self._video_decoder_cache,
+        )
+        return vid_key, frames.squeeze(0)
+
     def _query_videos(
         self,
         query_timestamps: dict[str, list[float]],
         episode_cache: dict,
     ) -> dict[str, torch.Tensor]:
-        item: dict = {}
-        for vid_key, query_ts in query_timestamps.items():
-            from_timestamp = episode_cache["video_from_timestamps"][vid_key]
-            shifted_query_ts = [from_timestamp + ts for ts in query_ts]
+        items = list(query_timestamps.items())
 
-            video_path = episode_cache["video_paths"][vid_key]
-            video_hw = self.videos_hw.get(vid_key, None) if self.videos_hw is not None else None
-            frames = decode_video_frames(
-                video_path,
-                shifted_query_ts,
-                self.tolerance_s,
-                self.video_backend,
-                shape=video_hw,
-                decoder_cache=self._video_decoder_cache,
+        # Single camera: no thread-pool overhead.
+        if len(items) <= 1:
+            return {k: v for k, v in (self._decode_single_camera(k, ts, episode_cache) for k, ts in items)}
+
+        # Decide pool size: env var override, else one thread per camera
+        # (capped at 8 to bound thread fan-out per worker).
+        if _VIDEO_DECODE_THREADS > 0:
+            n_threads = min(_VIDEO_DECODE_THREADS, len(items))
+        elif _VIDEO_DECODE_THREADS == 0:
+            n_threads = min(len(items), 8)
+        else:
+            n_threads = 1  # negative => disable threading
+
+        if n_threads <= 1:
+            return {k: v for k, v in (self._decode_single_camera(k, ts, episode_cache) for k, ts in items)}
+
+        if self._decode_pool is None or getattr(self._decode_pool, "_max_workers", 0) < n_threads:
+            if self._decode_pool is not None:
+                try:
+                    self._decode_pool.shutdown(wait=False)
+                except Exception:
+                    pass
+            self._decode_pool = ThreadPoolExecutor(
+                max_workers=n_threads,
+                thread_name_prefix="lerobot-decode",
             )
-            item[vid_key] = frames.squeeze(0)
-        return item
+
+        futures = [
+            self._decode_pool.submit(self._decode_single_camera, k, ts, episode_cache)
+            for k, ts in items
+        ]
+        return dict(f.result() for f in futures)
 
     # ---- Episode → abs_idx lookup ----
 
