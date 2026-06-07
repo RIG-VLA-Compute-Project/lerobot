@@ -381,7 +381,12 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         super().__init__()
         self.repo_id = repo_id
         self.root = Path(root) if root else HF_LEROBOT_HOME / repo_id
-        self.decode_camera_streams = set(decode_camera_streams) if decode_camera_streams else None
+        # NOTE: distinguish an explicit empty list (decode no cameras) from
+        # None (default: decode all). Collapsing `[]` to None would silently
+        # decode every on-disk stream — see `_get_decode_video_keys`.
+        self.decode_camera_streams = (
+            set(decode_camera_streams) if decode_camera_streams is not None else None
+        )
         self.delta_timestamps = delta_timestamps
         self.tolerance_s = tolerance_s
         self.revision = revision if revision else CODEBASE_VERSION
