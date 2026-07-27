@@ -199,7 +199,14 @@ def _read_and_index(path: Path, columns: list[str]) -> _CachedTable:
 
 
 class _ParquetTableLRU:
-    """Bounded LRU of ``_CachedTable`` objects keyed by parquet path.
+    """Bounded LRU of ``_CachedTable`` objects keyed by (parquet path,
+    projected column set).
+
+    The cache is shared process-wide while reads are projected to each
+    dataset's ``_keep_columns``, so the path alone is NOT a sufficient key:
+    two datasets over the same file with different column sets would poison
+    each other's reads (KeyError on the missing columns). Same-column-set
+    instances still share entries.
 
     Cache misses read outside the lock so concurrent misses on different
     paths don't serialise.
@@ -209,25 +216,26 @@ class _ParquetTableLRU:
         if max_tables < 1:
             raise ValueError("max_tables must be >= 1")
         self._max_tables = max_tables
-        self._entries: OrderedDict[Path, _CachedTable] = OrderedDict()
+        self._entries: OrderedDict[tuple, _CachedTable] = OrderedDict()
         self._lock = Lock()
 
     def get(self, path: Path, columns: list[str]) -> _CachedTable:
+        key = (path, tuple(sorted(columns)))
         with self._lock:
-            cached = self._entries.get(path)
+            cached = self._entries.get(key)
             if cached is not None:
-                self._entries.move_to_end(path)
+                self._entries.move_to_end(key)
                 return cached
 
         cached = _read_and_index(path, columns)
 
         with self._lock:
-            existing = self._entries.get(path)
+            existing = self._entries.get(key)
             if existing is not None:
-                self._entries.move_to_end(path)
+                self._entries.move_to_end(key)
                 return existing
-            self._entries[path] = cached
-            self._entries.move_to_end(path)
+            self._entries[key] = cached
+            self._entries.move_to_end(key)
             while len(self._entries) > self._max_tables:
                 self._entries.popitem(last=False)
         return cached
@@ -583,10 +591,22 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
                     return False
         return True
 
-    def _get_decode_video_keys(self) -> list[str]:
-        if self.decode_camera_streams is None:
-            return list(self._video_keys)
-        return [key for key in self._video_keys if key in self.decode_camera_streams]
+    def _get_decode_video_keys(self, camera_streams: "set[str] | list[str] | None" = None) -> list[str]:
+        allowed = (
+            set(self._video_keys)
+            if self.decode_camera_streams is None
+            else self.decode_camera_streams
+        )
+        if camera_streams is not None:
+            requested = set(camera_streams)
+            unknown = sorted(requested - allowed)
+            if unknown:
+                raise ValueError(
+                    f"Per-call camera_streams not in the constructed decode set: {unknown}. "
+                    f"Constructed streams: {sorted(allowed)}."
+                )
+            allowed = requested
+        return [key for key in self._video_keys if key in allowed]
 
     # ---- Path resolution ----
 
@@ -856,7 +876,12 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
 
     # ---- Main __getitem__ ----
 
-    def __getitem__(self, idx) -> dict:
+    def __getitem__(self, idx, camera_streams: "set[str] | list[str] | None" = None) -> dict:
+        """``camera_streams``: optional per-call subset of the constructed
+        decode streams — only these videos are decoded for this query
+        (m3_data per-sample camera selection). Must be a subset of the
+        construction-time ``decode_camera_streams``; the plain ``ds[idx]``
+        DataLoader path is unaffected."""
         abs_idx = idx
 
         ep_idx = self._episode_idx_from_abs_idx(abs_idx)
@@ -875,7 +900,7 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             query_result = self._query_rows(cached, query_indices)
             item = {**item, **padding, **query_result}
 
-        decode_video_keys = self._get_decode_video_keys()
+        decode_video_keys = self._get_decode_video_keys(camera_streams)
         if len(decode_video_keys) > 0:
             current_ts = item["timestamp"].item()
             query_timestamps = self._get_query_timestamps(cached, current_ts, query_indices)
