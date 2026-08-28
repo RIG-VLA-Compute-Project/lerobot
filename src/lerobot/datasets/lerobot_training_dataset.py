@@ -71,7 +71,9 @@ LeRobot 3.0 layout invariants used by this design:
     accordingly. The decoder cache is keyed by mp4 path.
 """
 
+import logging
 import os
+import weakref
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -88,7 +90,11 @@ import torch
 import torch.utils
 
 from lerobot.datasets.dataset_metadata import CODEBASE_VERSION
-from lerobot.datasets.training_dataset_metadata import LeRobotTrainingDatasetMetadata
+from lerobot.datasets.training_dataset_metadata import (
+    CACHE_STATS_EVERY,
+    LeRobotTrainingDatasetMetadata,
+    _LIVE_METADATA_INSTANCES,
+)
 from lerobot.datasets.feature_utils import (
     check_delta_timestamps,
     get_delta_indices,
@@ -128,6 +134,128 @@ _VIDEO_DECODER_CACHE_SIZE = _env_int("LEROBOT_VIDEO_DECODER_CACHE_SIZE", 64)
 _SKIP_FILE_CHECK = _env_flag("LEROBOT_SKIP_FILE_CHECK", default=False)
 _PREFETCH_MP4 = _env_flag("LEROBOT_PREFETCH_MP4", default=False)
 _VIDEO_DECODE_THREADS = _env_int("LEROBOT_VIDEO_DECODE_THREADS", 0)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic cache-stats (env-gated, see LEROBOT_CACHE_STATS_EVERY in
+# training_dataset_metadata.py). CACHE_STATS_EVERY == 0 disables this
+# entirely: no registration, no per-op overhead beyond the gate checks
+# below.
+# ---------------------------------------------------------------------------
+
+_LIVE_DATASET_INSTANCES: "weakref.WeakSet[LeRobotTrainingDataset]" = weakref.WeakSet()
+
+
+def _read_proc_status_rss() -> tuple[Optional[int], Optional[int], Optional[int]]:
+    """Return (RssAnon, RssFile, RssShmem) in kB from /proc/self/status, or
+    (None, None, None) if the file can't be read.
+
+    Bug this replaced: it split each matched line on ':' and stored the
+    result under the colon-less key (``"RssAnon"``), then looked values up
+    with the colon still attached (``"RssAnon:"``) — a pure key mismatch, so
+    every lookup missed regardless of kernel/page size. Values are parsed
+    per-line so one malformed line can't blank the other two.
+    """
+    wanted = ("RssAnon", "RssFile", "RssShmem")
+    values: dict[str, int] = {}
+    try:
+        with open("/proc/self/status") as f:
+            lines = f.readlines()
+    except OSError:
+        return None, None, None
+
+    for line in lines:
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key = key.strip()
+        if key not in wanted:
+            continue
+        parts = val.strip().split()
+        if not parts:
+            continue
+        try:
+            values[key] = int(parts[0])
+        except ValueError:
+            continue
+
+    return values.get("RssAnon"), values.get("RssFile"), values.get("RssShmem")
+
+
+def _emit_cache_stats(decoder_cache: "_PersistentVideoDecoderCache", ops: int) -> None:
+    """Log one [cache-stats] line summarizing per-process cache sizes and
+    RSS. Never raises: any failure is logged and swallowed so a diagnostic
+    can never break decoding."""
+    try:
+        with decoder_cache._lock:
+            decoder_open = len(decoder_cache._decoders)
+        hits = decoder_cache._stats_hits
+        misses = decoder_cache._stats_misses
+        evictions = decoder_cache._stats_evictions
+        constructed = decoder_cache._stats_constructed
+        distinct_paths = decoder_cache._distinct_paths_repr()
+
+        parquet_cache = _SHARED_PARQUET_CACHE
+        if parquet_cache is not None:
+            with parquet_cache._lock:
+                parquet_len = len(parquet_cache._entries)
+            parquet_cap = parquet_cache._max_tables
+        else:
+            parquet_len = 0
+            parquet_cap = 0
+
+        dataset_instances = list(_LIVE_DATASET_INSTANCES)
+        metadata_instances = list(_LIVE_METADATA_INSTANCES)
+
+        row_cache_total = 0
+        column_cache_total = 0
+        episodes_table_bytes = 0
+        for meta in metadata_instances:
+            episodes = getattr(meta, "episodes", None)
+            if episodes is not None:
+                row_cache_total += len(getattr(episodes, "_row_cache", {}))
+                column_cache_total += len(getattr(episodes, "_column_cache", {}))
+            table = getattr(meta, "_episodes_table", None)
+            nbytes = getattr(table, "nbytes", None) if table is not None else None
+            episodes_table_bytes += nbytes or 0
+
+        resolved_paths_total = sum(
+            len(getattr(ds, "_episode_resolved_paths", {})) for ds in dataset_instances
+        )
+
+        rss_anon_kb, rss_file_kb, rss_shmem_kb = _read_proc_status_rss()
+
+        logger.warning(
+            "[cache-stats] pid=%d ops=%d decoder_cache=%d/%s parquet_cache=%d/%d "
+            "live_datasets=%d live_metadata=%d row_cache=%d column_cache=%d "
+            "episodes_table_bytes=%d resolved_paths=%d "
+            "rss_anon_kb=%s rss_file_kb=%s rss_shmem_kb=%s "
+            "hits=%d misses=%d evictions=%d constructed=%d distinct_paths=%s",
+            os.getpid(),
+            ops,
+            decoder_open,
+            decoder_cache._max_open_decoders,
+            parquet_len,
+            parquet_cap,
+            len(dataset_instances),
+            len(metadata_instances),
+            row_cache_total,
+            column_cache_total,
+            episodes_table_bytes,
+            resolved_paths_total,
+            rss_anon_kb,
+            rss_file_kb,
+            rss_shmem_kb,
+            hits,
+            misses,
+            evictions,
+            constructed,
+            distinct_paths,
+        )
+    except Exception as exc:  # diagnostics must never break decoding
+        logger.warning("[cache-stats] failed to compute cache stats: %r", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -264,8 +392,37 @@ class _PersistentVideoDecoderCache(VideoDecoderCache):
         self._prefetch = prefetch
         self._lru: OrderedDict = OrderedDict()
         self._lru_lock = Lock()
+        self._stats_ops = 0
+        # Diagnostic-only counters (see [cache-stats]). Plain, unlocked
+        # integer increments: cheap enough to keep unconditional, and a
+        # missed increment under a rare race does not change any decoding
+        # behavior — these are read-only observations.
+        self._stats_hits = 0
+        self._stats_misses = 0
+        self._stats_evictions = 0
+        self._stats_constructed = 0
+        self._distinct_paths: set[str] = set()
+        self._distinct_paths_capped = False
+
+    def _distinct_paths_repr(self) -> str:
+        if self._distinct_paths_capped:
+            return ">=100000"
+        return str(len(self._distinct_paths))
+
+    def _note_distinct_path(self, path_str: str) -> None:
+        if self._distinct_paths_capped or path_str in self._distinct_paths:
+            return
+        if len(self._distinct_paths) >= 100_000:
+            self._distinct_paths_capped = True
+            return
+        self._distinct_paths.add(path_str)
 
     def get_decoder(self, video_path, shape=None):
+        if CACHE_STATS_EVERY:
+            self._stats_ops += 1
+            if self._stats_ops % CACHE_STATS_EVERY == 0:
+                _emit_cache_stats(self, self._stats_ops)
+
         path_str = str(video_path)
         shape_key = tuple(shape) if shape is not None else None
         key = (path_str, shape_key)
@@ -279,12 +436,15 @@ class _PersistentVideoDecoderCache(VideoDecoderCache):
         cached_decoder = None
         with self._lock:
             cached_decoder = self._decoders.get(key)
+        self._note_distinct_path(path_str)
         if cached_decoder is not None:
+            self._stats_hits += 1
             self._touch_lru(key)
             return cached_decoder
 
         # Cache miss. Prefetch the mp4 into page cache before any NFS read
         # from ffmpeg.
+        self._stats_misses += 1
         if self._prefetch:
             _prefetch_into_page_cache(Path(video_path))
 
@@ -292,6 +452,7 @@ class _PersistentVideoDecoderCache(VideoDecoderCache):
         # internally and handles the double-check). The parent will read
         # the (now-cached) mp4 to populate its own state.
         decoder = super().get_decoder(video_path, shape=shape)
+        self._stats_constructed += 1
 
         self._touch_lru(key)
         self._maybe_evict()
@@ -320,6 +481,7 @@ class _PersistentVideoDecoderCache(VideoDecoderCache):
         with self._lock:
             decoder = self._decoders.pop(key, None)
         if decoder is not None:
+            self._stats_evictions += 1
             self._close_decoders([decoder])
 
     def clear_except_paths(self, video_paths) -> None:
@@ -410,6 +572,9 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         # Lazy per-episode path resolution.
         self._episode_resolved_paths: dict[int, Path] = {}
         self._path_resolution_lock = Lock()
+
+        if CACHE_STATS_EVERY:
+            _LIVE_DATASET_INSTANCES.add(self)
 
         # Per-process shared caches.
         self._parquet_cache, self._video_decoder_cache = _get_shared_caches()

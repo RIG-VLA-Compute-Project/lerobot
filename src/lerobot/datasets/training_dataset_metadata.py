@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import weakref
 from pathlib import Path
 
 import packaging.version
@@ -19,6 +21,19 @@ from lerobot.datasets.utils import (
     check_version_compatibility,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
+
+# ---------------------------------------------------------------------------
+# Diagnostic cache-stats gate (see lerobot_training_dataset.py for the
+# consumer). Read once at import; single source of truth so both modules
+# agree on whether diagnostics are enabled. 0 (default) = fully disabled,
+# no instances are registered, no behavior change.
+# ---------------------------------------------------------------------------
+try:
+    CACHE_STATS_EVERY = int(os.environ.get("LEROBOT_CACHE_STATS_EVERY", "0"))
+except ValueError:
+    CACHE_STATS_EVERY = 0
+
+_LIVE_METADATA_INSTANCES: "weakref.WeakSet[LeRobotTrainingDatasetMetadata]" = weakref.WeakSet()
 
 
 class _EpisodeRows:
@@ -109,6 +124,9 @@ class LeRobotTrainingDatasetMetadata:
         self.subtasks = self._load_subtasks()
         self._episodes_table = self._load_episodes_table()
         self.episodes = _EpisodeRows(self._episodes_table)
+
+        if CACHE_STATS_EVERY:
+            _LIVE_METADATA_INSTANCES.add(self)
 
     def _load_info(self) -> dict:
         fpath = self.root / INFO_PATH
