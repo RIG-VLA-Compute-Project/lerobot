@@ -62,6 +62,12 @@ Tunable env vars (all per process):
                                                      parallel multi-camera
                                                      decode; set to 0/1 to
                                                      disable threading.
+  LEROBOT_SHARED_DECODE_POOL          (default 1)    1: ONE decode thread pool
+                                                     per process, shared by all
+                                                     dataset instances; 0: one
+                                                     pool per instance (before
+                                                     2026-11-09). See
+                                                     ``_shared_decode_pool``.
 
 LeRobot 3.0 layout invariants used by this design:
   * Multiple episodes can share a parquet file. The parquet LRU is keyed by
@@ -101,6 +107,7 @@ from lerobot.datasets.feature_utils import (
 )
 from lerobot.datasets.video_training_utils import (
     VideoDecoderCache,
+    decode_video_frame_groups,
     decode_video_frames,
     get_safe_default_codec,
 )
@@ -134,6 +141,7 @@ _VIDEO_DECODER_CACHE_SIZE = _env_int("LEROBOT_VIDEO_DECODER_CACHE_SIZE", 64)
 _SKIP_FILE_CHECK = _env_flag("LEROBOT_SKIP_FILE_CHECK", default=False)
 _PREFETCH_MP4 = _env_flag("LEROBOT_PREFETCH_MP4", default=False)
 _VIDEO_DECODE_THREADS = _env_int("LEROBOT_VIDEO_DECODE_THREADS", 0)
+_SHARED_DECODE_POOL = _env_flag("LEROBOT_SHARED_DECODE_POOL", default=True)
 
 logger = logging.getLogger(__name__)
 
@@ -517,6 +525,46 @@ def _get_shared_caches() -> tuple[_ParquetTableLRU, _PersistentVideoDecoderCache
     return _SHARED_PARQUET_CACHE, _SHARED_VIDEO_DECODER_CACHE
 
 
+# One decode thread pool per process (LEROBOT_SHARED_DECODE_POOL, default 1).
+#
+# Why (wam_ssm sw15 memtest 2778365, 2026-11-09): a pool per dataset instance
+# meant one idle-forever ThreadPoolExecutor (one thread per decoded camera)
+# for every subdataset a DataLoader worker ever decoded from. torch's CPU
+# allocator in the 26_07 container is mimalloc (statically in libc10): the
+# frame batch a decode thread allocates (torchcodec get_frames_at) belongs to
+# that thread's heap, and its free from the worker's main thread is only
+# collected when the OWNING thread allocates again. A thread whose subdataset
+# is not drawn again keeps its last batches resident, so a worker's RssAnon
+# grew ~120 MiB per distinct subdataset touched (2.8 GiB with 1 subdataset,
+# 17 GiB with ~100-140 touched). One shared pool bounds the threads (and so
+# the retained heaps) to the camera count. Same decoders, same decode calls,
+# same frames: only the thread a decode runs on changes. 0 = the previous
+# per-instance pools.
+_SHARED_POOL: Optional[ThreadPoolExecutor] = None
+_SHARED_POOL_PID: Optional[int] = None
+_SHARED_POOL_LOCK = Lock()
+
+
+def _shared_decode_pool(n_threads: int) -> ThreadPoolExecutor:
+    """The process's decode pool with at least ``n_threads`` threads. Grows by
+    replacement (the old pool finishes its queued work and its threads exit);
+    a pool inherited through fork (its threads do not exist in the child) is
+    never reused: keyed by pid."""
+    global _SHARED_POOL, _SHARED_POOL_PID
+    pid = os.getpid()
+    with _SHARED_POOL_LOCK:
+        pool = _SHARED_POOL if _SHARED_POOL_PID == pid else None
+        if pool is None or getattr(pool, "_max_workers", 0) < n_threads:
+            _SHARED_POOL = ThreadPoolExecutor(max_workers=n_threads, thread_name_prefix="lerobot-decode")
+            _SHARED_POOL_PID = pid
+            if pool is not None:
+                try:
+                    pool.shutdown(wait=False)
+                except Exception:
+                    pass
+        return _SHARED_POOL
+
+
 # ---------------------------------------------------------------------------
 # Main dataset class
 # ---------------------------------------------------------------------------
@@ -886,6 +934,21 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             except Exception:
                 pass
 
+    def _get_decode_pool(self, n_threads: int) -> ThreadPoolExecutor:
+        """The pool the multi-camera decode runs on: the process's shared pool
+        (LEROBOT_SHARED_DECODE_POOL=1, default) or this instance's own
+        (=0, the previous behaviour; never shut down while the instance lives)."""
+        if _SHARED_DECODE_POOL:
+            return _shared_decode_pool(n_threads)
+        if self._decode_pool is None or getattr(self._decode_pool, "_max_workers", 0) < n_threads:
+            if self._decode_pool is not None:
+                try:
+                    self._decode_pool.shutdown(wait=False)
+                except Exception:
+                    pass
+            self._decode_pool = ThreadPoolExecutor(max_workers=n_threads, thread_name_prefix="lerobot-decode")
+        return self._decode_pool
+
     # ---- Row materialisation ----
 
     @staticmethod
@@ -1014,22 +1077,59 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         if n_threads <= 1:
             return {k: v for k, v in (self._decode_single_camera(k, ts, episode_cache) for k, ts in items)}
 
-        if self._decode_pool is None or getattr(self._decode_pool, "_max_workers", 0) < n_threads:
-            if self._decode_pool is not None:
-                try:
-                    self._decode_pool.shutdown(wait=False)
-                except Exception:
-                    pass
-            self._decode_pool = ThreadPoolExecutor(
-                max_workers=n_threads,
-                thread_name_prefix="lerobot-decode",
-            )
-
+        pool = self._get_decode_pool(n_threads)
         futures = [
-            self._decode_pool.submit(self._decode_single_camera, k, ts, episode_cache)
+            pool.submit(self._decode_single_camera, k, ts, episode_cache)
             for k, ts in items
         ]
         return dict(f.result() for f in futures)
+
+    # ---- Grouped video decode (m3_data segment levers; __getitem__ never calls these) ----
+
+    def video_query_timestamps(
+        self, idx: int, camera_streams: "set[str] | list[str] | None" = None
+    ) -> tuple[int, dict[str, list[float]]]:
+        """``(episode index, {video key: query timestamps})`` of the video decode that
+        ``__getitem__(idx, camera_streams)`` runs (episode-relative, before the
+        ``from_timestamp`` shift). Reads the same parquet rows; decodes nothing."""
+        ep_idx = self._episode_idx_from_abs_idx(idx)
+        keys = self._get_decode_video_keys(camera_streams)
+        if not keys:
+            return ep_idx, {}
+        episode_cache = self._get_current_episode_cache(ep_idx)
+        cached = self._parquet_cache.get(self._resolve_episode_path(ep_idx), self._keep_columns)
+        query_indices = None
+        if self.delta_indices is not None:
+            query_indices, _ = self._get_query_indices(idx, episode_cache)
+        # as __getitem__ derives it (row -> torch scalar -> .item())
+        current_ts = torch.tensor(self._arrow_scalar_to_python(cached.table["timestamp"][cached.abs_to_row[idx]])).item()
+        ts = self._get_query_timestamps(cached, current_ts, query_indices)
+        return ep_idx, {k: ts[k] for k in keys}
+
+    def decode_video_groups(
+        self, episode_idx: int, groups: dict[str, list[list[float]]]
+    ) -> dict[str, tuple[torch.Tensor, list[list[int]], list[int]]]:
+        """``{video key: (frames [U, C, H, W], sel, frame_ids)}`` for timestamp groups of one
+        episode (``video_query_timestamps`` lists): each distinct frame of a stream decoded
+        once (``decode_video_frame_groups``); ``frames[sel[g]]`` is what ``__getitem__``
+        would have decoded for group g. Streams run on the decode thread pool like
+        ``_query_videos``."""
+        episode_cache = self._get_current_episode_cache(episode_idx)
+
+        def one(key: str):
+            shift = episode_cache["video_from_timestamps"][key]
+            hw = self.videos_hw.get(key, None) if self.videos_hw is not None else None
+            return key, decode_video_frame_groups(
+                episode_cache["video_paths"][key], [[shift + t for t in g] for g in groups[key]],
+                self.tolerance_s, self.video_backend, shape=hw, decoder_cache=self._video_decoder_cache)
+
+        keys = [k for k in groups if groups[k]]
+        n_threads = (min(_VIDEO_DECODE_THREADS, len(keys)) if _VIDEO_DECODE_THREADS > 0
+                     else min(len(keys), 8) if _VIDEO_DECODE_THREADS == 0 else 1)
+        if n_threads <= 1:
+            return dict(one(k) for k in keys)
+        pool = self._get_decode_pool(n_threads)
+        return dict(f.result() for f in [pool.submit(one, k) for k in keys])
 
     # ---- Episode → abs_idx lookup ----
 
@@ -1041,12 +1141,16 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
 
     # ---- Main __getitem__ ----
 
-    def __getitem__(self, idx, camera_streams: "set[str] | list[str] | None" = None) -> dict:
+    def __getitem__(self, idx, camera_streams: "set[str] | list[str] | None" = None, *,
+                    video_frames: "dict[str, torch.Tensor] | None" = None) -> dict:
         """``camera_streams``: optional per-call subset of the constructed
         decode streams — only these videos are decoded for this query
         (m3_data per-sample camera selection). Must be a subset of the
         construction-time ``decode_camera_streams``; the plain ``ds[idx]``
-        DataLoader path is unaffected."""
+        DataLoader path is unaffected. ``video_frames`` (m3_data segment levers):
+        the frames of every decoded stream, already decoded by the caller
+        (``decode_video_groups``); used in place of the decode, the rest of the
+        item is built exactly as without it."""
         abs_idx = idx
 
         ep_idx = self._episode_idx_from_abs_idx(abs_idx)
@@ -1083,7 +1187,11 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
                 or key[:-len("_is_pad")] in decode_video_keys
             }
 
-            video_frames = self._query_videos(query_timestamps, episode_cache)
+            if video_frames is None:
+                video_frames = self._query_videos(query_timestamps, episode_cache)
+            elif set(video_frames) != set(query_timestamps):
+                raise ValueError(f"video_frames has streams {sorted(video_frames)}, the query needs "
+                                 f"{sorted(query_timestamps)}")
             item = {**video_frames, **item}
 
         task_idx = item["task_index"].item()

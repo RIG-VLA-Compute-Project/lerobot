@@ -416,6 +416,66 @@ def decode_video_frames_torchcodec(
     return closest_frames
 
 
+def decode_video_frame_groups(
+    video_path: Path | str,
+    groups: list[list[float]],
+    tolerance_s: float,
+    backend: str | None = None,
+    shape: tuple[int, int] | None = None,
+    decoder_cache: VideoDecoderCache | None = None,
+) -> tuple[torch.Tensor, list[list[int]], list[int]]:
+    """Decode several timestamp groups of ONE video with each distinct frame decoded once.
+
+    ``groups[g]`` is the timestamp list one ``decode_video_frames(video_path, groups[g], ...)``
+    call would get. Returns ``(frames, sel, frame_ids)``: ``frames`` [U, C, H, W] uint8 = the
+    distinct decoded frames in ascending frame order, ``sel[g]`` the rows of ``frames`` that
+    call would return (``frames[sel[g]]`` == its output, frame for frame), ``frame_ids[u]`` the
+    video frame index of row u. torchcodec: the per-group nearest-frame choice and tolerance
+    check are the single-call ones, run over that group's own loaded frames only, so a group
+    gets exactly the frame (and the same FrameTimestampError) it would get alone. Other
+    backends: one plain call per group, no frame shared (``frame_ids`` = -1)."""
+    if backend is None:
+        backend = get_safe_default_codec()
+    if backend != "torchcodec":
+        outs = [decode_video_frames(video_path, g, tolerance_s, backend, shape=shape, decoder_cache=decoder_cache)
+                for g in groups]
+        sel, start = [], 0
+        for o in outs:
+            sel.append(list(range(start, start + o.shape[0])))
+            start += o.shape[0]
+        return torch.cat(outs), sel, [-1] * start
+    if decoder_cache is None:
+        transforms = [Resize(shape)] if shape is not None else None
+        decoder = VideoDecoder(str(video_path), seek_mode="approximate", num_ffmpeg_threads=1, transforms=transforms)
+    else:
+        decoder = decoder_cache.get_decoder(video_path, shape=shape)
+    average_fps = decoder.metadata.average_fps
+    group_idx = [[round(ts * average_fps) for ts in g] for g in groups]
+    distinct = sorted({i for g in group_idx for i in g})
+    frames_batch = decoder.get_frames_at(indices=distinct)
+    row_of = {fi: u for u, fi in enumerate(distinct)}
+    pts = [p.item() for p in frames_batch.pts_seconds]
+    sel = []
+    for g_ts, g_idx in zip(groups, group_idx, strict=True):
+        query_ts = torch.tensor(g_ts)
+        loaded_ts = torch.tensor([pts[row_of[i]] for i in g_idx])
+        dist = torch.cdist(query_ts[:, None], loaded_ts[:, None], p=1)
+        min_, argmin_ = dist.min(1)
+        is_within_tol = min_ < tolerance_s
+        if not is_within_tol.all():
+            raise FrameTimestampError(
+                f"One or several query timestamps unexpectedly violate the tolerance ({min_[~is_within_tol]} > {tolerance_s=})."
+                " It means that the closest frame that can be loaded from the video is too far away in time."
+                " This might be due to synchronization issues with timestamps during data collection."
+                " To be safe, we advise to ignore this item during training."
+                f"\nqueried timestamps: {query_ts}"
+                f"\nloaded timestamps: {loaded_ts}"
+                f"\nvideo: {video_path}"
+            )
+        sel.append([row_of[g_idx[a]] for a in argmin_.tolist()])
+    return frames_batch.data, sel, distinct
+
+
 @dataclass
 class VideoFrame:
     # TODO(rcadene, lhoestq): move to Hugging Face `datasets` repo
