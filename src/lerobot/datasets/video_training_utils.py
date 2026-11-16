@@ -16,6 +16,7 @@
 import importlib
 import logging
 import warnings
+from contextlib import AbstractContextManager, nullcontext
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -125,6 +126,10 @@ class VideoDecoderCache:
     def __init__(self) -> None:
         self._decoders: dict[tuple[str, tuple[int, int] | None], VideoDecoder] = {}
         self._lock = Lock()
+        # One lock per (path, shape) key: a torchcodec VideoDecoder must never be used by two
+        # threads at once (concurrent get_frames_at segfaults). Held by the decode entry points
+        # around every decoder call; uncontended unless two threads share a decoder.
+        self._decoder_locks: dict[tuple[str, tuple[int, int] | None], Lock] = {}
 
     def get_decoder(
         self,
@@ -149,6 +154,19 @@ class VideoDecoderCache:
 
             return decoder
 
+    def decoder_lock(
+        self,
+        video_path: Path | str,
+        shape: tuple[int, int] | None = None,
+    ) -> Lock:
+        """The lock serializing all use of the decoder cached for ``(video_path, shape)``."""
+        key = (str(video_path), tuple(shape) if shape is not None else None)
+        with self._lock:
+            lock = self._decoder_locks.get(key)
+            if lock is None:
+                lock = self._decoder_locks[key] = Lock()
+            return lock
+
     def clear(self) -> None:
         with self._lock:
             decoders = list(self._decoders.values())
@@ -172,6 +190,17 @@ class VideoDecoderCache:
                     close()
                 except Exception:
                     logger.debug("Failed to close cached VideoDecoder", exc_info=True)
+
+
+def _decoder_guard(
+    decoder_cache: "VideoDecoderCache | None",
+    video_path: Path | str,
+    shape: tuple[int, int] | None,
+) -> AbstractContextManager:
+    """Lock for a cached decoder (never shared between threads); no-op for a private one."""
+    if decoder_cache is None:
+        return nullcontext()
+    return decoder_cache.decoder_lock(video_path, shape)
 
 
 def decode_video_frames(
@@ -370,7 +399,8 @@ def decode_video_frames_torchcodec(
     # convert timestamps to frame indices
     frame_indices = [round(ts * average_fps) for ts in timestamps]
     # retrieve frames based on indices
-    frames_batch = decoder.get_frames_at(indices=frame_indices)
+    with _decoder_guard(decoder_cache, video_path, shape):
+        frames_batch = decoder.get_frames_at(indices=frame_indices)
 
     for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=True):
         loaded_frames.append(frame)
@@ -452,7 +482,8 @@ def decode_video_frame_groups(
     average_fps = decoder.metadata.average_fps
     group_idx = [[round(ts * average_fps) for ts in g] for g in groups]
     distinct = sorted({i for g in group_idx for i in g})
-    frames_batch = decoder.get_frames_at(indices=distinct)
+    with _decoder_guard(decoder_cache, video_path, shape):
+        frames_batch = decoder.get_frames_at(indices=distinct)
     row_of = {fi: u for u, fi in enumerate(distinct)}
     pts = [p.item() for p in frames_batch.pts_seconds]
     sel = []

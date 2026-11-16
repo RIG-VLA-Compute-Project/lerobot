@@ -81,7 +81,7 @@ import logging
 import os
 import weakref
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
@@ -563,6 +563,17 @@ def _shared_decode_pool(n_threads: int) -> ThreadPoolExecutor:
                 except Exception:
                     pass
         return _SHARED_POOL
+
+
+def _gather_all(futures: list) -> list:
+    """Results of ``futures`` in order, returned or raised only once EVERY future has finished.
+
+    A sibling decode must never outlive the call that submitted it: the caller (m3_data) catches a
+    decode error and immediately decodes the next sample, which can reuse the cached torchcodec
+    decoder an orphaned sibling is still using; two threads on one decoder segfault. On failure
+    the first error in submission order is raised."""
+    wait(futures)
+    return [f.result() for f in futures]
 
 
 # ---------------------------------------------------------------------------
@@ -1082,7 +1093,7 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
             pool.submit(self._decode_single_camera, k, ts, episode_cache)
             for k, ts in items
         ]
-        return dict(f.result() for f in futures)
+        return dict(_gather_all(futures))
 
     # ---- Grouped video decode (m3_data segment levers; __getitem__ never calls these) ----
 
@@ -1129,7 +1140,7 @@ class LeRobotTrainingDataset(torch.utils.data.Dataset):
         if n_threads <= 1:
             return dict(one(k) for k in keys)
         pool = self._get_decode_pool(n_threads)
-        return dict(f.result() for f in [pool.submit(one, k) for k in keys])
+        return dict(_gather_all([pool.submit(one, k) for k in keys]))
 
     # ---- Episode → abs_idx lookup ----
 
